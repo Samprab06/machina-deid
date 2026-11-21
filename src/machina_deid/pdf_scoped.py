@@ -354,6 +354,24 @@ def _mismatch(page, keep: list) -> int:
     return _lost_chars(keep, _chars(page))
 
 
+def _shift_cost(page, keep: list) -> tuple[int, float]:
+    """(lost glyphs, summed sub-tolerance displacement of kept glyphs): the reflow fix minimizes both so a
+    corrected run lands on its original position, not merely within the 0.6pt acceptance tolerance."""
+    chars = _chars(page)
+    lost = _lost_chars(keep, chars)
+    exact = Counter(keep) - Counter((c, _rkey(b)) for c, b in chars)
+    if not exact:
+        return lost, 0.0
+    pool: dict[str, list] = {}
+    for c, b in chars:
+        pool.setdefault(c, []).append(b)
+    err = 0.0
+    for c, b in exact.elements():
+        ds = [max(abs(x - y) for x, y in zip(b, q)) for q in pool.get(c, [])]
+        err += min([d for d in ds if d <= 2.0] or [2.0])
+    return lost, round(err, 3)
+
+
 def _fix_redaction_shift(doc, page, keep: list, edits) -> int:
     """MuPDF 2.x compensates a glyph run removed from the middle of a TJ/Tj by one glyph advance too little, so
     text after an embedded edit slides left. Correct the new TJ displacement per shifted run, accepted only
@@ -384,17 +402,24 @@ def _fix_redaction_shift(doc, page, keep: list, edits) -> int:
 
                     def put(d):
                         doc.update_stream(xref, data[:a] + f"{val - d * 1000 / size:.4f}".encode() + data[b:])
-                        return _mismatch(page, keep)
+                        return _shift_cost(page, keep)
                     got = put(dx)
-                    if got < base:
+                    if got[0] < base:
                         best = (got, dx)
-                        for k in range(1, 13):  # refine: boxes were compared on a 0.5pt grid
+                        # refine on (lost, residual displacement): boxes were compared on a 0.5pt grid, and a
+                        # count of 0 at 0.6pt tolerance can still leave every trailing glyph a few tenths off
+                        for k in range(1, 13):
                             for d in (dx - 0.1 * k, dx + 0.1 * k):
-                                if best[0] == 0:
-                                    break
                                 g = put(d)
                                 if g < best[0]:
                                     best = (g, d)
+                        step = 0.05
+                        while step >= 0.005 and best[0][1] > 0:
+                            for d in (best[1] - step, best[1] + step):
+                                g = put(d)
+                                if g < best[0]:
+                                    best = (g, d)
+                            step /= 2
                         put(best[1])
                         fixed += 1
                         progress = True

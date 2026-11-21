@@ -68,7 +68,8 @@ def test_embedded_mention_rewritten_and_trailing_text_kept(tmp_path):
     assert "Maria Keller" not in t and "markup today" in t
     src = {w[4]: w[:4] for w in pymupdf.open(items[0][0])[1].get_text("words")}
     dst = {w[4]: w[:4] for w in out[1].get_text("words")}
-    assert abs(src["markup"][0] - dst["markup"][0]) < 0.5
+    for w in ("markup", "today"):
+        assert abs(src[w][0] - dst[w][0]) < 0.05, (w, src[w][0], dst[w][0])
 
 
 def test_canonical_pseudonym_same_in_narrow_and_wide_cells(tmp_path):
