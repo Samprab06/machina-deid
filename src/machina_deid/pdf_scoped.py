@@ -639,7 +639,7 @@ def _verify(src, out_path, plans, keep, before, geometry, pairs, res: ScopedResu
         res.edits_verified = sum(e.status == "verified" for es in plans.values() for e in es)
         # whole-document residual of every resolved value (independent inspector, all locations)
         from .pdf_residual import inspect_pdf
-        rep = inspect_pdf(out_path, list(pairs))
+        rep = inspect_pdf(out_path, list(pairs), word_boundaries=True)
         if not rep.ok:
             failed_checks["independent_inspection_incomplete"] += 1
         for k, v in rep.residual.items():

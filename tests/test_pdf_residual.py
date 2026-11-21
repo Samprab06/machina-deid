@@ -232,3 +232,17 @@ def test_zip_member_pdf_independent_residual(tmp_path, cat):
         z.write(inner, "docs/m.pdf")
     o = tp.transform_file(cat, src, tmp_path / "out.zip")
     assert o.residual_approved >= 1 and not o.fully_clean, o.to_dict()
+
+
+def test_scoped_inspector_rejects_whole_identifiers_without_flagging_substrings(tmp_path):
+    path = tmp_path / "scoped.pdf"
+    with pymupdf.open() as doc:
+        page = doc.new_page()
+        page.insert_text((50, 50), "Install the distributor")
+        page.insert_text((50, 70), "Alice")
+        page.insert_text((50, 90), "Martin")
+        doc.save(path)
+
+    result = inspect_pdf(path, ["Tor", "Alice Martin"], word_boundaries=True)
+    assert result.residual["visible_text"] > 0
+    assert set(result.residual_by_index) == {1}
