@@ -897,6 +897,11 @@ corpus into input, install the checkout with Python 3.12 and the recorded depend
 run code/run_full_corpus.py run --expected-revision <commit>. The identity seed is generated locally
 and retained privately; it is not part of this package.
 
+Attempt 2c adds a frozen shared PDF/OLE identity scope (built after the catalog, digest pinned in the
+ledger): PDF title-block / contact / cross-document mentions and OLE saved-account records resolve only
+through it. code/PROVENANCE.json ties commit, source archive, lock file, catalog and entity-map digests and
+an output manifest digest together; it contains no values.
+
 Only identities approved by the pinned pipeline are transformed. Unsupported files, files with no
 approved identities, and files whose transforms fail are retained byte-for-byte. These files are NOT
 de-identified and may still contain identities. Transformed files may also retain residual approved
@@ -923,18 +928,44 @@ def package(cfg: Config, rows, ledger, commit: str, script: Path | None) -> dict
     if code.exists():
         shutil.rmtree(code)
     code.mkdir()
+    source_sha = ""
     if cfg.check_git:
-        with subprocess.Popen(["git", "-C", str(cfg.repo), "archive", commit], stdout=subprocess.PIPE) as archive:
-            subprocess.run(["tar", "-xf", "-", "-C", str(code)], stdin=archive.stdout, check=True)
-            if archive.wait():
-                raise RunnerError("git source archive failed")
+        # git archive of a commit is byte-reproducible (entries and mtimes come from the commit object)
+        tar = subprocess.run(["git", "-C", str(cfg.repo), "archive", "--format=tar", commit], capture_output=True)
+        if tar.returncode:
+            raise RunnerError("git source archive failed")
+        source_sha = hashlib.sha256(tar.stdout).hexdigest()
+        subprocess.run(["tar", "-xf", "-", "-C", str(code)], input=tar.stdout, check=True)
     if script is not None:
         shutil.copyfile(script, code / "run_full_corpus.py")
     with (code / "run-dependencies.txt").open("w") as target:
         subprocess.run([sys.executable, "-m", "pip", "freeze", "--exclude-editable"], stdout=target, check=False,
                        stderr=subprocess.DEVNULL)
+    prov = provenance(cfg, ledger, commit, source_sha, recs)
+    atomic_write(code / "PROVENANCE.json", json.dumps(prov, indent=2, sort_keys=True) + "\n")
+    summary["provenance_sha256"] = hashlib.sha256(json.dumps(prov, sort_keys=True).encode()).hexdigest()
     atomic_write(cfg.attempt_dir / "README.txt", README + json.dumps(summary, indent=2) + "\n")
     return summary
+
+
+def provenance(cfg: Config, ledger, commit: str, source_sha: str, recs) -> dict:
+    """Value-free, reproducible package provenance: identical inputs + commit + seed give identical JSON."""
+    h = hashlib.sha256()
+    for path, status, size, digest in sorted(recs):
+        h.update(f"{path}\t{status}\t{size}\t{digest}\n".encode("utf-8"))
+    lock = cfg.repo / "uv.lock"
+    return {
+        "format": "machina-deid/provenance/1",
+        "commit": commit,
+        "source_archive_sha256": source_sha,
+        "uv_lock_sha256": hashlib.sha256(lock.read_bytes()).hexdigest() if lock.exists() else "",
+        "python": "%d.%d" % sys.version_info[:2],
+        "catalog_digest": meta_get(ledger, "catalog_digest") or "",
+        "entity_map_digest": meta_get(ledger, SCOPE_KEY) or "",
+        "outputs": len(recs),
+        "output_manifest_sha256": h.hexdigest(),
+        "outcomes": dict(sorted(Counter(r[1] for r in recs).items())),
+    }
 
 
 # ------------------------------------------------------------------ entry points

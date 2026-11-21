@@ -384,7 +384,7 @@ def transform_pdf_scoped(src: str | Path, dst: str | Path, resolver: Resolver, *
             res.reason = "no_resolved_identities"
             return res
         dst.parent.mkdir(parents=True, exist_ok=True)
-        doc.save(tmp, garbage=3, deflate=True)
+        doc.save(tmp, garbage=3, deflate=True, no_new_id=True)  # reproducible output bytes
     finally:
         doc.close()
 

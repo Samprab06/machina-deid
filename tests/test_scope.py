@@ -154,3 +154,18 @@ def test_scope_map_unchanged_by_run(produced):
     digest = pr.meta_get(led, pr.SCOPE_KEY)
     sc.Scope(p, (root / "ops/attempt-1/seed").read_bytes(), digest)  # verifies frozen digest
     assert hashlib.sha256(p.read_bytes()).hexdigest() == d
+
+
+def test_reproducible_package_and_provenance(produced, tmp_path):
+    import json
+    root, head, files, out = produced
+    p1 = json.loads((root / "attempts/attempt-1/code/PROVENANCE.json").read_text())
+    assert p1["entity_map_digest"] and p1["source_archive_sha256"] and p1["outputs"] == len(files)
+    again = pr.run(cfg(root, head, len(files)))  # complete attempt: re-package only
+    assert again["provenance_sha256"] == out["provenance_sha256"]
+    # an independent workspace with identical inputs/seed reproduces every output digest and the map digest
+    head2 = make_workspace(tmp_path, files)
+    pr.run(cfg(tmp_path, head2, len(files)))
+    p2 = json.loads((tmp_path / "attempts/attempt-1/code/PROVENANCE.json").read_text())
+    for k in ("entity_map_digest", "catalog_digest", "output_manifest_sha256", "outcomes"):
+        assert p1[k] == p2[k], k
