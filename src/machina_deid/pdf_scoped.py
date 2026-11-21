@@ -300,8 +300,10 @@ _TJ_ARRAY = re.compile(rb"\[((?:[^\]\\]|\\.)*)\]\s*TJ", re.S)
 _TJ_NUM = re.compile(rb"(?<=[)>\s\]\[])(-?\d+(?:\.\d+)?)(?=\s*[(<])")
 
 
-def _shifted_runs(page, keep: list) -> list[tuple[float, float, float]]:
-    """(y, x_orig, dx) per line whose surviving glyphs moved horizontally by one uniform dx after redaction."""
+def _shifted_runs(page, keep: list) -> list[tuple[float, float, float, str]]:
+    """(cross, start, d, axis) per line whose surviving glyphs moved by one uniform distance along the text
+    direction after redaction. axis "x": horizontal rows (cross = y); axis "y": vertical runs from a rotated
+    text matrix (cross = x), where trailing glyphs slide along y in either direction."""
     if not _mismatch(page, keep):
         return []
     want = Counter(keep)
@@ -311,20 +313,24 @@ def _shifted_runs(page, keep: list) -> list[tuple[float, float, float]]:
         return []
     extra = list(have - want)
     out = []
-    by_row: dict[tuple, list] = {}
-    for c, b in missing:
-        by_row.setdefault((round(b[1] * 2), round(b[3] * 2)), []).append((c, b))
-    for row, chs in by_row.items():
-        cands = [(c, b) for c, b in extra if (round(b[1] * 2), round(b[3] * 2)) == row]
-        diffs = []
-        for c, b in chs:
-            near = [b[0] - b2[0] for c2, b2 in cands if c2 == c and b[0] - b2[0] > 0]
-            if near:
-                diffs.append(min(near))
-        if diffs and len(diffs) >= len(chs) * 0.8:
-            dx = sorted(diffs)[len(diffs) // 2]
-            if dx > 0.25 and sum(abs(d - dx) <= 1.0 for d in diffs) >= len(chs) * 0.8:
-                out.append(((row[0] + row[1]) / 4, min(b[0] for _, b in chs), dx))
+    for axis, (lo, hi, along) in (("x", (1, 3, 0)), ("y", (0, 2, 1))):
+        by_row: dict[tuple, list] = {}
+        for c, b in missing:
+            by_row.setdefault((round(b[lo] * 2), round(b[hi] * 2)), []).append((c, b))
+        for row, chs in by_row.items():
+            cands = [(c, b) for c, b in extra if (round(b[lo] * 2), round(b[hi] * 2)) == row]
+            for sign in ((1,) if axis == "x" else (1, -1)):
+                diffs = []
+                for c, b in chs:
+                    near = [sign * (b[along] - b2[along]) for c2, b2 in cands
+                            if c2 == c and sign * (b[along] - b2[along]) > 0]
+                    if near:
+                        diffs.append(min(near))
+                if diffs and len(diffs) >= len(chs) * 0.8:
+                    dx = sorted(diffs)[len(diffs) // 2]
+                    if dx > 0.25 and sum(abs(d - dx) <= 1.0 for d in diffs) >= len(chs) * 0.8:
+                        out.append(((row[0] + row[1]) / 4, min(b[along] for _, b in chs), dx, axis))
+                        break
     return out
 
 
@@ -381,10 +387,11 @@ def _fix_redaction_shift(doc, page, keep: list, edits) -> int:
         runs = _shifted_runs(page, keep)
         if not runs:
             break
-        y, x0, dx = runs[0]
-        row = [e for e in edits if e.rect[1] - 2 <= y <= e.rect[3] + 2] or list(edits)
+        y, x0, dx, axis = runs[0]
+        lo, hi = (1, 3) if axis == "x" else (0, 2)
+        row = [e for e in edits if e.rect[lo] - 2 <= y <= e.rect[hi] + 2] or list(edits)
         size = row[0].size or 8.0
-        widths = [e.rect[2] - e.rect[0] for e in row]
+        widths = [(e.rect[2] - e.rect[0]) if axis == "x" else (e.rect[3] - e.rect[1]) for e in row]
         base = _mismatch(page, keep)
         progress = False
         for xref in page.get_contents():

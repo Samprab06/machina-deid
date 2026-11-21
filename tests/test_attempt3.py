@@ -72,6 +72,23 @@ def test_embedded_mention_rewritten_and_trailing_text_kept(tmp_path):
         assert abs(src[w][0] - dst[w][0]) < 0.05, (w, src[w][0], dst[w][0])
 
 
+@pytest.mark.parametrize("rot,origin", [(90, (100, 700)), (270, (100, 100))])
+def test_rotated_text_matrix_reflow_fixed(tmp_path, rot, origin):
+    """Mid-string edit in vertical (rotated text-matrix) text: trailing glyphs restored, page not skipped."""
+    d = pymupdf.open()
+    d.new_page().insert_text(origin, "DRAWN BY: Maria Keller", fontsize=9, rotate=rot)
+    d.new_page().insert_text(origin, "Revision notes: updated per Maria Keller markup today", fontsize=9, rotate=rot)
+    scope, items = _scope(tmp_path, {"r.pdf": d.tobytes()})
+    res = transform_pdf_scoped(items[0][0], tmp_path / "o.pdf", scope.resolver(), overwrite=True)
+    assert res.ok and not res.partial and res.skipped_pages == 0 and res.reflow_fixed >= 1
+    out = pymupdf.open(tmp_path / "o.pdf")
+    assert "Maria Keller" not in out[1].get_text()
+    src = {w[4]: w[:4] for w in pymupdf.open(items[0][0])[1].get_text("words")}
+    dst = {w[4]: w[:4] for w in out[1].get_text("words")}
+    for w in ("markup", "today"):
+        assert max(abs(a - b) for a, b in zip(src[w], dst[w])) < 0.05, (w, src[w], dst[w])
+
+
 def test_canonical_pseudonym_same_in_narrow_and_wide_cells(tmp_path):
     d1 = pymupdf.open()
     p = d1.new_page()
