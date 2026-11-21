@@ -189,7 +189,10 @@ def apply_auto(cat: IdentityCatalog, cands: list[Candidate]) -> dict[str, int]:
         else:
             kind = auto_kind(c) if status == "approved" else None
             if kind is None:
-                status, reason = "review", "ambiguous source field requires explicit typed approval"
+                # The candidate is untrusted text and can literally equal a word in a
+                # human-readable reason.  Use an opaque keyed reference so the catalog's
+                # value-leak guard remains meaningful without rejecting valid candidates.
+                status, reason = "review", "ambiguous_source_field:" + key[:16]
                 res = cat.decide("text", c.value, status, reason=reason, source="auto")
             else:
                 res = cat.decide(kind, c.value, status, reason=reason, source="auto")

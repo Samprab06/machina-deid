@@ -175,6 +175,13 @@ def test_auto_never_overrides_manual(cat):
     assert cat.approve("text", ORG) == "approved"
 
 
+def test_auto_review_reason_is_safe_for_literal_reason_text(cat):
+    # A real candidate can equal words used in the fixed review explanation.  The
+    # catalog must not mistake that structural explanation for leaked evidence.
+    candidate = Candidate("text_label_value", "approval", "pdf:page[0].title_block[0]", "medium", "label")
+    assert tp.apply_auto(cat, [candidate])["review"] == 1
+
+
 def test_alias_approval_and_conflict(cat):
     p = cat.approve_alias("org", ORG, ALIAS)
     assert cat.approved_pseudonym(ALIAS) == ("org", p) == cat.approved_pseudonym(ORG)
