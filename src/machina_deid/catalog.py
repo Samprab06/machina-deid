@@ -142,7 +142,52 @@ class IdentityCatalog:
         self.close()
 
     @contextmanager
+    def group(self) -> Iterator[None]:
+        """Group-commit many catalog operations into ONE durable transaction.
+
+        Inside the block every ``_tx`` becomes a SAVEPOINT (same per-operation rollback semantics)
+        and pseudonym-store saves are deferred. On normal exit the store is persisted (fsync) FIRST,
+        then the catalog COMMITs (synchronous=FULL), so every committed catalog pseudonym is always
+        present in the store. On an exception everything in the group is rolled back; new
+        in-memory pseudonyms are still saved (a store superset is valid and deterministic).
+        Reads inside the group see the group's own uncommitted writes, so results are identical
+        to per-operation commits.
+        """
+        if getattr(self, "_grouped", False):
+            yield
+            return
+        self._db.execute("BEGIN IMMEDIATE")
+        self._grouped = True
+        self._mapper._defer_save = True
+        try:
+            yield
+        except BaseException:
+            self._grouped = False
+            self._db.execute("ROLLBACK")
+            self._mapper._defer_save = False
+            self._mapper.flush()
+            raise
+        self._grouped = False
+        self._mapper._defer_save = False
+        try:
+            self._mapper.flush()  # store durable before the catalog references it
+        except BaseException:
+            self._db.execute("ROLLBACK")
+            raise
+        self._db.execute("COMMIT")
+
+    @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
+        if getattr(self, "_grouped", False):
+            self._db.execute("SAVEPOINT op")
+            try:
+                yield self._db
+            except BaseException:
+                self._db.execute("ROLLBACK TO op")
+                self._db.execute("RELEASE op")
+                raise
+            self._db.execute("RELEASE op")
+            return
         self._db.execute("BEGIN IMMEDIATE")
         try:
             yield self._db

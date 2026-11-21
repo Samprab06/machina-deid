@@ -154,3 +154,73 @@ need a rerun (for example an input MD5 mismatch; see the logged `errors`).
   runner afterwards without a fresh review.
 - A full restore of the pre-migration state is in `ops/attempt-1/pre-migration-dc3da69/` (SQLite
   backups plus the pseudonym store). The seed is never copied.
+
+## Group-commit discovery checkpoints (upgrade from 27757e3)
+
+**Why:** in 27757e3 each manifest row paid for 1 catalog COMMIT for its observations, 1 COMMIT per
+distinct auto-decided value, a full rewrite and fsync of the pseudonym JSON for each new approved identity
+(cost grows roughly with the square of the identity count), and 1 ledger COMMIT (rollback journal,
+`synchronous=FULL`). On an ext4 loop file over WSL DrvFS this kept the parent in D state at about 4–6 rows/s.
+
+**Now:** each discovery batch (`--batch-files`, default 256, also capped by `--batch-bytes`) is checkpointed as:
+
+1. all catalog work for the batch runs in one `BEGIN IMMEDIATE`. Each catalog operation is a SAVEPOINT,
+   so a failing operation rolls back exactly as before, and reads see the batch's own writes, so
+   auto-approval results are identical;
+2. the pseudonym store is written once (atomic temp file, fsync, rename, directory fsync);
+3. the catalog COMMITs (WAL, `synchronous=FULL`, unchanged);
+4. the batch's ledger rows are inserted in manifest order and COMMITted once (`synchronous=FULL`, unchanged).
+
+No PRAGMA was weakened. **Crash invariant:** a ledger row is never durable unless its catalog effects
+and pseudonyms are. A crash before step 3 loses only that batch's uncommitted work. A crash between
+steps 3 and 4 leaves catalog rows without ledger rows, so those rows are re-discovered on resume. All
+catalog writes are idempotent (`INSERT OR IGNORE` observation keys; auto decisions never override; deterministic
+HMAC pseudonyms), so resume never doubles observations or changes pseudonyms. A store with extra entries is
+valid; the reopen check only requires catalog ⊆ store. Tests:
+`tests/test_group_commit.py` (state equivalence with per-row commits for batch 1/7/64 and workers 1/3; a
+real process crash between the catalog and ledger commits followed by resume; group rollback; SAVEPOINT isolation;
+one store write per group; 27757e3 → new migration and rollback).
+
+**Measured** (`scripts/discovery_commit_benchmark.py`, checkpoint I/O only, synthetic, local ext4 on
+aarch64; state hash identical in every case):
+
+| rows | distinct identities | per-row rows/s | group rows/s | speedup |
+|---:|---:|---:|---:|---:|
+| 1000 | 5 | 155 | 4365 | 28× |
+| 2000 | 500 | 102 | 3035 | 30× |
+| 3000 | 3000 | 29 | 671 | 23× |
+
+Run it on the real work directory's filesystem to check before rollout (no real data is read):
+`$PY $ROOT/repo/scripts/discovery_commit_benchmark.py --rows 2000 --identities 500 --dir $ROOT/ops`.
+
+**Limits:** one pseudonym-store rewrite per batch still grows with store size (O(store) per batch, not
+per identity). Parsing is now the expected discovery bound. Up to one batch of discovery work is redone
+after a crash. The transform phase still fsyncs each staged output and its directory (this is required
+for publish durability); if transforms become I/O-bound, that is the next candidate (batched directory fsyncs).
+
+### Rollout (live run pinned to 27757e3, discovery phase, no outputs)
+
+```sh
+ROOT=/mnt/machina-deid; PY=<python of the live env>
+NEW=<pushed commit of claude/machina-submission-readiness>
+OLD=27757e305f9dbc8e4b607f991a6491734a7091ed
+pgrep -af 'run_full_corpus|local-runner'; kill -INT <RUNNER_PID>     # NOT the downloader
+sleep 5; pgrep -af 'run_full_corpus|local-runner'                    # must be empty
+git -C $ROOT/repo fetch origin claude/machina-submission-readiness
+git -C $ROOT/repo checkout --detach $NEW && test -z "$(git -C $ROOT/repo status --porcelain)"
+$PY $ROOT/repo/scripts/run_full_corpus.py migrate --root $ROOT --from-revision $OLD --expected-revision $NEW
+#   -> backs up to ops/attempt-1/pre-migration-27757e3/, writes migration.json, re-pins $NEW
+nohup $PY $ROOT/repo/scripts/run_full_corpus.py run --root $ROOT --expected-revision $NEW \
+    --workers 8 --heavy-slots 2 >> $ROOT/ops/attempt-1/runner.log 2>&1 &
+grep 'Discovery checkpoint' $ROOT/ops/attempt-1/runner.log | tail -3   # should advance per batch
+```
+
+The dc3da69 migration path is unchanged (`--from-revision dc3da69225167cfe81bfbd5803ed02902efd0219`).
+
+### Rollback (before any output)
+
+Stop the runner, then run `$PY $ROOT/repo/scripts/run_full_corpus.py rollback-migration --root $ROOT`.
+This re-pins 27757e3. Then run `git -C $ROOT/repo checkout --detach $OLD` and restart the old runner
+the same way. The on-disk formats are identical (same tables, pragmas and store format), and rows
+discovered by the new runner are reused as is. A full pre-upgrade copy is in
+`ops/attempt-1/pre-migration-27757e3/`.

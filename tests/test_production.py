@@ -10,7 +10,8 @@ from production_fixtures import SEED, file_set, make_workspace, tree_digest, wri
 from machina_deid import production as pr
 from machina_deid.catalog import IdentityCatalog
 
-DC3 = next(iter(pr.MIGRATABLE_FROM))
+DC3 = "dc3da69225167cfe81bfbd5803ed02902efd0219"
+R277 = "27757e305f9dbc8e4b607f991a6491734a7091ed"
 
 
 def cfg_for(root, head, n, **kw):

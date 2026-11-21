@@ -113,8 +113,17 @@ class PseudonymMapper:
         self._map[key] = name
         self._used.add(name)
         if self._store_path is not None:
-            self.save()
+            if getattr(self, "_defer_save", False):
+                self._dirty = True
+            else:
+                self.save()
         return name
+
+    def flush(self) -> None:
+        """Persist deferred additions (one atomic fsynced write), if any."""
+        if getattr(self, "_dirty", False) and self._store_path is not None:
+            self.save()
+            self._dirty = False
 
     @staticmethod
     def _format(kind: str, token: str) -> str:

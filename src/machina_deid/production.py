@@ -51,7 +51,11 @@ MAX_FILE_BYTES = 2_000_000_000  # organizer per-file cap (decimal 2 GB)
 MAX_CORPUS_OBJECTS = 400_000
 CHUNK = 1 << 20
 # The only revision whose live state may be adopted (discovery semantics are unchanged since then).
-MIGRATABLE_FROM = {"dc3da69225167cfe81bfbd5803ed02902efd0219"}
+MIGRATABLE_FROM = {
+    "dc3da69225167cfe81bfbd5803ed02902efd0219",
+    # 27757e3: identical on-disk state and discovery semantics; only per-row commits differ.
+    "27757e305f9dbc8e4b607f991a6491734a7091ed",
+}
 RUNNER_PATTERNS = ("run_full_corpus", "local-runner")
 TEST_CRASH_ENV = "MACHINA_DEID_TEST_CRASH_SUFFIX"  # test-only: worker exits hard on this suffix
 
@@ -362,16 +366,25 @@ def discover(cfg: Config, rows, ledger, catalog) -> None:
                 args = [(str(src), r.path) for r, src in batch]
                 results = (executor.map(_discover_task, *zip(*args)) if executor
                            else (_discover_task(*a) for a in args))
-                for (r, _), (kind, members) in zip(batch, results):  # strictly manifest order
-                    if kind == "parsed":
-                        res = twopass.BatchResult()
-                        twopass._record_discovered(catalog, [members], res, True)
-                        status = "discovery_exception" if res.failed else "inspected"
-                    else:
-                        status = kind
-                    ledger.execute("INSERT INTO discovery VALUES (?, ?)", (r.path, status))
-                    ledger.commit()
-                    done.add(r.path)
+                # Group commit (one durable transaction per batch, see docs/production-runner.md):
+                # pseudonym store fsync -> catalog COMMIT -> ledger COMMIT. A crash at any point
+                # leaves ledger rows only for catalog effects that are already durable; uncommitted
+                # rows are simply re-discovered (all catalog writes are idempotent).
+                staged = []
+                with catalog.group():
+                    for (r, _), (kind, members) in zip(batch, results):  # strictly manifest order
+                        if kind == "parsed":
+                            res = twopass.BatchResult()
+                            twopass._record_discovered(catalog, [members], res, True)
+                            status = "discovery_exception" if res.failed else "inspected"
+                        else:
+                            status = kind
+                        staged.append((r.path, status))
+                if os.environ.get(TEST_CRASH_ENV + "_DISCOVERY") == "after_catalog":
+                    os._exit(71)  # test-only crash window between catalog and ledger commits
+                ledger.executemany("INSERT INTO discovery VALUES (?, ?)", staged)
+                ledger.commit()
+                done.update(p for p, _ in staged)
                 if len(done) - last_report >= 250 or len(done) == total:
                     log(f"Discovery checkpoint: {len(done):,}/{total:,}")
                     last_report = len(done)
@@ -760,9 +773,9 @@ def run(cfg: Config, *, script: Path | None = None, discovery_only: bool = False
 
 
 def migrate(cfg: Config, from_revision: str, to_revision: str) -> dict:
-    """Adopt a dc3da69 discovery-phase state for this revision; refuses once any output exists."""
+    """Adopt a dc3da69 or 27757e3 discovery-phase state for this revision; refuses once any output exists."""
     if from_revision not in MIGRATABLE_FROM:
-        raise RunnerError("only the documented dc3da69 state can be migrated")
+        raise RunnerError("only the documented dc3da69 or 27757e3 state can be migrated")
     if len(to_revision) != 40:
         raise RunnerError("target revision must be a full 40-character commit id")
     if other_runner_processes():
