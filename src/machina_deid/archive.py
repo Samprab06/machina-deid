@@ -36,6 +36,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 
 from .idmap import IdentityMap
+from .transform_counts import TransformCounts
+
 
 def is_metadata_sidecar(name: str) -> bool:
     """AppleDouble/resource-fork sidecars (``__MACOSX/...`` or ``._*``): metadata, never the named format."""
@@ -82,6 +84,7 @@ class MemberReport:
     residual: dict[int, int] = field(default_factory=dict)  # identity index -> occurrences left
     name_contains_identity: bool = False
     children: list["MemberReport"] = field(default_factory=list)
+    changes: TransformCounts = field(default_factory=TransformCounts)
 
 
 @dataclass
@@ -205,6 +208,7 @@ def _transform_member(kind: str, data: bytes, idmap: IdentityMap, work: Path, re
             if r.outcome == "transformed_validated":
                 rep.outcome = "transformed_validated"
                 out = dst.read_bytes()
+                rep.changes.step_header_replacements = sum(r.replacements.values())
                 rep.residual = _scan(out, idmap)  # DATA section is never edited; report what remains
                 return out
             if r.outcome == "inspected_no_identifiers":
@@ -218,19 +222,21 @@ def _transform_member(kind: str, data: bytes, idmap: IdentityMap, work: Path, re
             from .pdf_transform import transform_pdf
             r = transform_pdf(src, dst, idmap)
             rep.replacements = dict(r.matches)
-            if r.ok and r.matches:
+            if r.ok and (r.matches or r.changes.total):
                 from .pdf_residual import inspect_pdf
                 ind, base = inspect_pdf(dst, list(idmap.strings)), inspect_pdf(src, [])
                 if (ind.ok and base.ok and not ind.total
                         and (ind.pages, ind.dimensions) == (base.pages, base.dimensions)):
+                    out = dst.read_bytes()
                     rep.outcome = "transformed_validated"
-                    return dst.read_bytes()
+                    rep.changes = r.changes
+                    return out
                 rep.outcome, rep.reason = "identifiers_unmodifiable", "pdf_independent_residual"
                 rep.residual = dict(ind.residual_by_index) or _scan(data, idmap)
                 return data
             if r.ok:
                 rep.outcome = "inspected_no_identifiers"
-                rep.residual = _scan(data, idmap)  # e.g. metadata-only hits are kept and reported
+                rep.residual = _scan(data, idmap)
                 return data
             rep.outcome, rep.reason = "identifiers_unmodifiable", "pdf_validation_failed"
             rep.residual = dict(r.residual) or _scan(data, idmap)
@@ -242,8 +248,10 @@ def _transform_member(kind: str, data: bytes, idmap: IdentityMap, work: Path, re
             changed = bool(r.text_replacements or r.header_replacements or r.layers_renamed or r.blocks_renamed)
             if r.ok and changed:
                 rep.outcome = "transformed_validated"
+                out = dst.read_bytes()
                 rep.residual = dict(r.residual_raw)
-                return dst.read_bytes()
+                rep.changes.dxf_replacements = r.verified_identity_fields_changed
+                return out
             if r.ok:
                 rep.outcome = "inspected_no_identifiers"
                 rep.residual = dict(r.residual_raw)

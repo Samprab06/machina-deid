@@ -463,11 +463,14 @@ def run_transform(cat: IdentityCatalog, files: list[dict], checks: dict, out_dir
             o = tp.TransformOutcome(e["id"], None, "failed", f"transform_error:{type(exc).__name__}")
         b = by[e["group"]]
         b[f"status:{o.status}"] += 1
+        b.update(o.replacement_counts())
         b["fields_replaced"] += o.fields_replaced
         b["residual_approved"] += o.residual_approved
         b["source_unchanged"] += bool(o.source_unchanged)
     return {"scope": "already-approved candidates only (unchanged twopass policy)",
             "by_format": {g: dict(sorted(v.items())) for g, v in sorted(by.items())},
+            "total_verified_identity_fields_changed": sum(
+                v["total_verified_identity_fields_changed"] for v in by.values()),
             "elapsed_s": round(time.monotonic() - t0, 3), "peak_rss_mib_cumulative": peak_rss_mib()}
 
 

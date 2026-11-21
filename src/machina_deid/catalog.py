@@ -94,7 +94,8 @@ class Observation:
 
 
 class IdentityCatalog:
-    def __init__(self, db_path: str | os.PathLike, secret: bytes, store_path: str | os.PathLike | None = None):
+    def __init__(self, db_path: str | os.PathLike, secret: bytes, store_path: str | os.PathLike | None = None,
+                 *, read_only: bool = False):
         db_path = Path(db_path)
         store_path = Path(store_path) if store_path is not None else db_path.with_suffix(".pseudonyms.json")
         try:
@@ -103,17 +104,28 @@ class IdentityCatalog:
             raise CatalogError(str(exc)) from None
         self._secret = bytes(secret)
         self._fingerprint = self._mapper._fingerprint()
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        new = not db_path.exists()
-        self._db = sqlite3.connect(db_path, isolation_level=None)
-        if new:
-            os.chmod(db_path, 0o600)
-        self._db.execute("PRAGMA foreign_keys = ON")
-        self._db.execute("PRAGMA journal_mode = WAL")
-        self._db.execute("PRAGMA synchronous = FULL")
-        self._migrate()
-        self._check_secret()
-        self._check_store_consistency()
+        if read_only:
+            self._db = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None)
+        else:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            new = not db_path.exists()
+            self._db = sqlite3.connect(db_path, isolation_level=None)
+            if new:
+                os.chmod(db_path, 0o600)
+        try:
+            if read_only:
+                if self._db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                    raise CatalogError("read-only catalog requires the current schema")
+            else:
+                self._db.execute("PRAGMA foreign_keys = ON")
+                self._db.execute("PRAGMA journal_mode = WAL")
+                self._db.execute("PRAGMA synchronous = FULL")
+                self._migrate()
+            self._check_secret()
+            self._check_store_consistency()
+        except BaseException:
+            self.close()
+            raise
 
     def __repr__(self) -> str:
         return "IdentityCatalog(<redacted>)"
@@ -154,7 +166,6 @@ class IdentityCatalog:
     def _check_secret(self) -> None:
         row = self._db.execute("SELECT value FROM meta WHERE key='secret_fingerprint'").fetchone()
         if row is None or not hmac.compare_digest(row[0], self._fingerprint):
-            self.close()
             raise CatalogError("catalog was created with a different secret")
 
     def _check_store_consistency(self) -> None:
@@ -162,7 +173,6 @@ class IdentityCatalog:
         known = set(self._mapper._map.values())
         missing = sum(1 for (p,) in self._db.execute("SELECT pseudonym FROM identities") if p not in known)
         if missing:
-            self.close()
             raise CatalogError(f"pseudonym store is missing {missing} catalog entries")
 
     # ------------------------------------------------------------ keys

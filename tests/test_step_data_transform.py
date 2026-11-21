@@ -142,12 +142,14 @@ def test_twopass_typed_org_approval_required(tmp_path):
 
 def test_twopass_header_and_data_stages_combined(tmp_path):
     src = tmp_path / "h.stp"
-    src.write_bytes(step_bytes(org="('Acme Widgets Ltd')", data=ORG_DATA))
+    src.write_bytes(step_bytes(author="('')", org="('Acme Widgets Ltd')", data=ORG_DATA))
     with IdentityCatalog(tmp_path / "c.db", SECRET) as cat:
         tp.discover_batch(cat, [(src, "h.stp")], limit=10)  # FILE_NAME org auto-approved as typed org
         assert cat.approved_pseudonym("Acme Widgets Ltd", kind="org") is not None
         o = tp.transform_file(cat, src, tmp_path / "o.stp", "h.stp")
         assert o.status == "transformed", o.reason
-        assert o.data_organizations_replaced == 1 and o.fields_replaced >= 2
+        assert o.data_organizations_replaced == o.changes.step_data_replacements == 1
+        assert o.changes.step_header_replacements == 1
+        assert o.total_verified_identity_fields_changed == o.fields_replaced == 2
         b = (tmp_path / "o.stp").read_bytes()
         assert b.count(b"Acme Widgets Ltd") == 3  # CARTESIAN_POINT label, PERSON, description: untouched

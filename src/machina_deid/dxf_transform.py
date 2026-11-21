@@ -34,6 +34,7 @@ class DxfResult:
     entities: int = 0
     text_replacements: dict[int, int] = field(default_factory=dict)
     header_replacements: int = 0
+    verified_identity_fields_changed: int = 0
     layers_renamed: int = 0
     blocks_renamed: int = 0
     residual_in_entities: dict[int, int] = field(default_factory=dict)
@@ -181,28 +182,34 @@ def transform_dxf(src: str | Path, dst: str | Path, idmap: IdentityMap, *, overw
     for t, n in res.unsupported_types.items():
         res.warnings.append(f"{n} {t} entities not text-transformed (may carry identity text)")
 
+    edited_texts = {}
     for e, text in list(_entity_texts(doc)):
         new = _replace(text, pairs, index, res.text_replacements)
         if new != text:
+            edited_texts[e.dxf.handle] = new
             if e.dxftype() == "MTEXT":
                 e.text = new
             else:
                 e.dxf.text = new
 
     # header string variables and custom properties
+    edited_headers = {}
     for var in _HEADER_STR_VARS:
         if var in doc.header:
             old = doc.header[var]
             new = _replace(old, pairs, index, {}) if isinstance(old, str) else old
             if new != old:
                 doc.header[var] = new
+                edited_headers[var] = new
                 res.header_replacements += 1
     cv = doc.header.custom_vars
-    for i, (tag, value) in enumerate(list(cv)):
+    original_custom = list(cv)
+    for tag, value in original_custom:
         new = _replace(value, pairs, index, {})
         if new != value:
             cv.replace(tag, new)
-            res.header_replacements += 1
+    custom_changed = sum(old != new for old, new in zip(original_custom, cv))
+    res.header_replacements += custom_changed
 
     # explicitly mapped layer / block names
     if idmap.layers:
@@ -233,7 +240,11 @@ def transform_dxf(src: str | Path, dst: str | Path, idmap: IdentityMap, *, overw
     res.entity_counts_equal = counts_before == counts_after
     res.numeric_invariants_equal = _compare(nums_before, nums_after)
 
-    after_texts = [t for _, t in _entity_texts(out)]
+    after_texts_by_handle = {e.dxf.handle: text for e, text in _entity_texts(out)}
+    readback_ok = (all(after_texts_by_handle.get(h) == text for h, text in edited_texts.items())
+                   and all(out.header.get(var) == value for var, value in edited_headers.items())
+                   and (not custom_changed or list(out.header.custom_vars) == list(cv)))
+    after_texts = list(after_texts_by_handle.values())
     for old, _ in pairs:
         n = sum(t.count(old) for t in after_texts)
         if n:
@@ -256,11 +267,14 @@ def transform_dxf(src: str | Path, dst: str | Path, idmap: IdentityMap, *, overw
     if res.residual_raw:
         res.warnings.append("mapped strings still present in untransformed locations (raw scan)")
 
-    res.ok = (res.entity_counts_equal and res.numeric_invariants_equal and res.new_strings_present
+    if not readback_ok:
+        res.warnings.append("edited identity fields differ on readback")
+    res.ok = (readback_ok and res.entity_counts_equal and res.numeric_invariants_equal and res.new_strings_present
               and not res.residual_in_entities and not any("rename not reflected" in w for w in res.warnings))
     if res.ok:
         tmp.replace(dst)
         res.output_sha256 = _sha256(dst)
+        res.verified_identity_fields_changed = len(edited_texts) + res.header_replacements
     else:
         tmp.unlink()
     return res

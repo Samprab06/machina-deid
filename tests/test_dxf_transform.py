@@ -102,3 +102,15 @@ def test_refuses_same_path(tmp_path):
     make_dxf(src)
     with pytest.raises(ValueError):
         transform_dxf(src, src, IdentityMap(strings={NAME: "P"}), overwrite=True)
+
+
+def test_verified_count_counts_a_field_with_repeated_identity_once(tmp_path):
+    src, dst = tmp_path / "in.dxf", tmp_path / "out.dxf"
+    doc = ezdxf.new("R2010")
+    doc.header["$PROJECTNAME"] = NAME
+    doc.modelspace().add_text(f"{NAME} / {NAME}")
+    doc.saveas(src)
+    result = transform_dxf(src, dst, IdentityMap(strings={NAME: "Person-ABCDE"}))
+    assert result.ok, result.to_dict()
+    assert result.text_replacements == {0: 2}
+    assert result.verified_identity_fields_changed == 2

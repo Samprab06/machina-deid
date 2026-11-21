@@ -19,7 +19,7 @@ import os
 import re
 import tempfile
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 
 from . import archive as ar
@@ -27,6 +27,7 @@ from .catalog import IdentityCatalog
 from .classify import classify_path
 from .discovery import Candidate, discover_dxf, discover_path, discover_pdf, discover_step
 from .idmap import IdentityMap
+from .transform_counts import TransformCounts
 
 SUPPORTED = ("pdf", "dxf", "step", "zip")
 _AUTO_LOCATIONS = re.compile(r"^(?:pdf:metadata\.author|step:FILE_NAME\.(?:author|organization)\[\d+\])$")
@@ -308,7 +309,7 @@ def _transform_step(src: Path, dst: Path, idmap: IdentityMap, org_map: dict[str,
             r = transform_step(src, mid, idmap)
             out.residual_approved += _sum(r.unmodifiable) + _sum(r.mapped_present_in_unrequested_fields)
             if r.outcome == "transformed_validated":
-                out.fields_replaced += _sum(r.replacements)
+                out.changes.step_header_replacements = _sum(r.replacements)
                 stage = mid
             elif not r.ok:
                 out.reason = r.reason or r.outcome
@@ -317,8 +318,7 @@ def _transform_step(src: Path, dst: Path, idmap: IdentityMap, org_map: dict[str,
             d = transform_organizations(stage, dst, org_map, overwrite=overwrite)
             out.residual_approved += d.unmodifiable
             if d.outcome == "transformed_validated":
-                out.fields_replaced += _sum(d.replacements)
-                out.data_organizations_replaced = _sum(d.replacements)
+                out.changes.step_data_replacements = _sum(d.replacements)
                 return True
             if not d.ok:
                 out.reason = "data:" + (d.reason or d.outcome)
@@ -363,8 +363,23 @@ class TransformOutcome:
     independent_residual: dict[str, int] = field(default_factory=dict)  # category -> count (PDF rescan)
     fully_clean: bool = False  # transformed AND no residual approved value detected anywhere
 
+    changes: TransformCounts = field(default_factory=TransformCounts)
+    archive_replacements: int = 0
+    nested_archive_replacements: int = 0
+
+    @property
+    def total_verified_identity_fields_changed(self) -> int:
+        return self.changes.total
+
+    def replacement_counts(self) -> dict[str, int]:
+        return {**asdict(self.changes), "archive_replacements": self.archive_replacements,
+                "nested_archive_replacements": self.nested_archive_replacements,
+                "total_verified_identity_fields_changed": self.total_verified_identity_fields_changed}
+
     def to_dict(self) -> dict:
-        return dict(self.__dict__)
+        data = dict(self.__dict__)
+        del data["changes"]
+        return {**data, **self.replacement_counts()}
 
 
 def _sum(d: dict) -> int:
@@ -399,14 +414,15 @@ def transform_file(cat: IdentityCatalog, src: str | Path, dst: str | Path, rel_p
         if fmt == "pdf":
             from .pdf_transform import transform_pdf
             r = transform_pdf(src, dst, idmap, overwrite=overwrite)
-            ok, out.fields_replaced, out.residual_approved = r.ok, _sum(r.matches), _sum(r.residual)
+            ok, out.residual_approved = r.ok, _sum(r.residual)
+            out.changes = r.changes
             if ok:
                 ok = _independent_pdf_check(src, dst, list(idmap.strings), out)
         elif fmt == "dxf":
             from .dxf_transform import transform_dxf
             r = transform_dxf(src, dst, idmap, overwrite=overwrite)
             ok = r.ok
-            out.fields_replaced = _sum(r.text_replacements) + r.header_replacements
+            out.changes.dxf_replacements = r.verified_identity_fields_changed
             out.residual_approved = _sum(r.residual_in_entities) + _sum(r.residual_raw)
         elif fmt == "step":
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -415,12 +431,22 @@ def transform_file(cat: IdentityCatalog, src: str | Path, dst: str | Path, rel_p
             r = ar.transform_zip(src, dst, idmap, overwrite=overwrite)
             ok = r.ok
             flat = list(ar._walk(r.members))
-            out.fields_replaced = sum(_sum(m.replacements) for m in flat)
+            if ok:
+                for member in flat:
+                    if member.outcome == "transformed_validated":
+                        out.changes.add(member.changes)
+                        if member.depth:
+                            out.nested_archive_replacements += member.changes.total
+                out.archive_replacements = out.changes.total
             out.residual_approved = sum(_sum(m.residual) for m in flat)
             out.reason = r.reason
     except (OSError, ValueError) as exc:
         ok, out.reason = False, f"transform_error:{type(exc).__name__}"
     out.output_written = dst.exists() and ok
+    if not out.output_written:
+        out.changes = TransformCounts()
+    out.fields_replaced = out.changes.total
+    out.data_organizations_replaced = out.changes.step_data_replacements
     out.status = "transformed" if ok else "failed"
     if not ok and not out.reason:
         out.reason = "transformer_validation_failed"

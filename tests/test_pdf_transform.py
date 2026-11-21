@@ -29,6 +29,8 @@ def test_redacts_replaces_and_preserves(tmp_path):
     res = transform_pdf(src, dst, IdentityMap(strings={NAME: "Person-ABCDE"}))
     assert res.ok, res.to_dict()
     assert res.matches == {0: 1} and not res.residual
+    assert res.changes.pdf_visible_text_replacements == 1
+    assert res.changes.pdf_metadata_identities_changed == 2
     assert res.pages == 2 and res.pages_preserved and res.dimensions_preserved
     assert res.attachments_before == res.attachments_after == 1
     assert res.metadata_cleared and res.xmp_cleared

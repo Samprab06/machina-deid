@@ -366,3 +366,49 @@ def test_step_org_also_in_preprocessor_transformed_but_residual_reported(tmp_pat
     assert ORG not in org_field and cat.approved_pseudonym(ORG)[1] in org_field
     assert ORG in pre_field  # unsupported field left untouched, surfaced as residual
     assert src.read_bytes() == before
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_pdf_metadata_only_counts_validated_fields(tmp_path, cat, nested):
+    doc = pymupdf.open()
+    doc.new_page().insert_text((50, 50), "Drawing dimensions")
+    doc.set_metadata({"author": PERSON, "subject": f"{PERSON}; {PERSON}", "creator": "CAD"})
+    doc.set_xml_metadata(f"<metadata><author>{PERSON}</author></metadata>")
+    doc.embfile_add("notes.txt", b"notes")
+    pdf = doc.tobytes()
+    doc.close()
+
+    src = tmp_path / ("in.zip" if nested else "in.pdf")
+    dst = tmp_path / ("out.zip" if nested else "out.pdf")
+    if nested:
+        inner = io.BytesIO()
+        with zipfile.ZipFile(inner, "w") as archive:
+            archive.writestr("sample.pdf", pdf)
+        with zipfile.ZipFile(src, "w") as archive:
+            archive.writestr("inner.zip", inner.getvalue())
+    else:
+        src.write_bytes(pdf)
+    cat.approve("person", PERSON)
+    outcome = tp.transform_file(cat, src, dst)
+    counts = outcome.replacement_counts()
+    assert outcome.fully_clean, outcome.to_dict()
+    assert counts["pdf_visible_text_replacements"] == 0
+    assert counts["pdf_metadata_identities_changed"] == 3
+    assert counts["pdf_attachment_changes"] == counts["pdf_form_changes"] == counts["pdf_annotation_changes"] == 0
+    assert counts["archive_replacements"] == counts["nested_archive_replacements"] == (3 if nested else 0)
+    assert counts["total_verified_identity_fields_changed"] == outcome.fields_replaced == 3
+    assert PERSON not in json.dumps(outcome.to_dict())
+
+
+def test_failed_pdf_validation_reports_no_verified_changes(tmp_path, cat):
+    src, dst = tmp_path / "in.pdf", tmp_path / "out.pdf"
+    with pymupdf.open() as doc:
+        doc.new_page().insert_text((50, 50), "Drawing dimensions")
+        doc.set_metadata({"author": PERSON})
+        doc.embfile_add("notes.txt", PERSON.encode())
+        doc.save(src)
+    cat.approve("person", PERSON)
+    outcome = tp.transform_file(cat, src, dst)
+    assert outcome.status == "failed" and not dst.exists()
+    assert outcome.independent_residual["embedded_files"] > 0
+    assert not any(outcome.replacement_counts().values())

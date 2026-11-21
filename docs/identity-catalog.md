@@ -74,8 +74,7 @@ Schema v2 adds an `approvals` table (one row per exact `(kind, normalized value)
 2. Auto policy (`auto_decision`): approve only `person_or_org`, `high` confidence, from PDF Info
    `/Author` or STEP `FILE_NAME` author/organization. Everything else (file_name, project, part,
    description, text_label_value, path_component, software, unknown, DXF `$LASTSAVEDBY`) becomes `review`.
-   Auto approvals use kind `text` (`Identity-...`) because person and org cannot be told apart from these
-   fields, so the same string gets one pseudonym across formats.
+   Auto approval is typed for structurally explicit STEP `FILE_NAME.author` (`person`) and `organization` (`org`) fields. PDF `/Author` remains ambiguous and requires explicit typed review; it is never silently assigned a person or organization kind.
 3. `build_identity_map(cat, candidates)` returns an in-memory `IdentityMap` (strings only) of approved
    exact values. `transform_file` re-discovers the current file, builds the map and calls the unchanged
    transformers. STEP stays FILE_NAME-header only; the DATA section is analysis-only.
@@ -120,3 +119,46 @@ Organization roles are not attributes of `ORGANIZATION`. They are carried by `OR
   again on its own output is a no-op.
 - **Limitation:** no geometry/topology validation is performed, because no trusted geometry kernel is
   available. Geometric validity is inferred only from the structural and numeric invariants above.
+
+## Phase 5G: private candidate review
+
+`scripts/private_review.py` is a local-only review tool; all its output lives under
+`/srv/new2/machina-deid/work/<bench>/review/<name>/` (directories 0700, files 0600) and never in Git.
+
+* `report --bench B --catalog C` checks the frozen `selection.json`/`checksums.json` against the files, runs
+  discovery again on the selected files, and groups candidates by the catalog's normalized value key.
+  It does not change the catalog. `private-review.json` is the only file that holds raw values;
+  `public-summary.json` and the default stdout contain only opaque 16-hex digests and counts.
+  Pass `--show-private` to print raw values to the terminal.
+* `decide --bench B --catalog C --report <private-review.json>` records explicit, typed manual decisions
+  through `IdentityCatalog.decide(source="manual")`. Identities are referred to by digest, never by raw value:
+  either pass `--digest D --kind K --decision approve|reject|review --reason "..."`, or use `--stdin` with
+  lines of the form `<digest> <kind> <decision> <reason>`.
+
+Reports are authenticated with the catalog secret and tied to the benchmark, the frozen files,
+and the catalog path. Regenerate reports created by the earlier unsigned workflow before deciding.
+The report opens the catalog read-only. Decision input is checked as a batch before writes, and reasons
+must use generic descriptions without candidate values or private paths.
+
+### Verified transformation counts
+
+The Phase 5E benchmark transformation section and the catalog transform output report these counts:
+
+- PDF visible-text replacements are counted when the original disappears and the replacement is
+  extracted on the same page. Metadata counts each cleared Info field or parsed XMP text or
+  attribute field that contained a mapped identity once, even when the identity occurs repeatedly
+  or multiple identities share the field. Attachments, forms, and existing annotations have no
+  supported identity rewrite and report zero changes.
+- STEP counts validated FILE_NAME header and typed DATA organization changes separately. DXF
+  counts edited entity text and header fields verified on readback, once per field.
+- ZIP and nested ZIP counts are subtotals of validated leaf-member changes. Those same changes
+  contribute once to their format category and once to the total, regardless of nesting depth.
+- `total_verified_identity_fields_changed` and the legacy `fields_replaced` field use the same
+  total. Failed validation contributes zero. Residuals are reported separately, and a validated
+  change alone does not establish that the output is fully clean.
+
+The frozen Phase 5E sample includes the previously approved metadata-only PDF. The existing
+approval produced two verified metadata changes and zero visible-text replacements. Inspection
+of the ten selected neutral and mesh files did not establish a metadata field with both a reviewed
+identity and a verified geometry-preserving rewrite. The redacted inspection report is stored
+with the private benchmark results.
