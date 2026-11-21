@@ -203,15 +203,28 @@ def _transform_member(kind: str, data: bytes, idmap: IdentityMap, work: Path, re
     try:
         if kind == "step":
             from .step_transform import transform_step
+            from .step_data_transform import transform_identities
             r = transform_step(src, dst, idmap)
             rep.replacements = dict(r.replacements)
-            if r.outcome == "transformed_validated":
-                rep.outcome = "transformed_validated"
-                out = dst.read_bytes()
-                rep.changes.step_header_replacements = sum(r.replacements.values())
-                rep.residual = _scan(out, idmap)  # DATA section is never edited; report what remains
-                return out
-            if r.outcome == "inspected_no_identifiers":
+            if r.outcome in ("transformed_validated", "inspected_no_identifiers"):
+                stage = dst if r.outcome == "transformed_validated" else src
+                if r.outcome == "transformed_validated":
+                    rep.changes.step_header_replacements = sum(r.replacements.values())
+                # Attempt 2: DATA person/organization positions (exact approved values only)
+                dd = work / f"{uuid.uuid4().hex}.data"
+                try:
+                    d = transform_identities(stage, dd, dict(idmap.strings))
+                    if d.outcome == "transformed_validated":
+                        rep.changes.step_data_replacements = sum(d.replacements.values())
+                        os.replace(dd, dst)
+                        stage = dst
+                finally:
+                    dd.unlink(missing_ok=True)
+                if stage is dst:
+                    rep.outcome = "transformed_validated"
+                    out = dst.read_bytes()
+                    rep.residual = _scan(out, idmap)  # independent raw rescan; genuine leftovers stay visible
+                    return out
                 rep.outcome = "inspected_no_identifiers"
                 rep.residual = _scan(data, idmap)
             else:

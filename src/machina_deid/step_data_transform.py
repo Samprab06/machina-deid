@@ -64,6 +64,8 @@ class OrgSite:
     start: int  # opening quote offset
     end: int  # just past closing quote
     value: str | None  # decoded exact value; None if undecodable
+    etype: str = ENTITY
+    pidx: int = NAME_INDEX
 
 
 @dataclass
@@ -92,7 +94,16 @@ def decode_literal(raw: str) -> str | None:
     return text
 
 
-def parse(data: bytes) -> Parsed:
+# Attempt 2: identity-bearing DATA attribute positions (ISO 10303-41 person_organization_schema).
+# type -> (arity, string-parameter indices). Only exact decoded equality with an approved value is replaced.
+ORG_SPEC = {ENTITY: (ARITY, (NAME_INDEX,))}
+IDENTITY_SPEC = {
+    "ORGANIZATION": (3, (0, 1)),          # id, name
+    "PERSON": (6, (0, 1, 2)),             # id, last_name, first_name
+}
+
+
+def parse(data: bytes, spec: dict = ORG_SPEC) -> Parsed:
     if len(data) > MAX_BYTES:
         raise StepDataError("file_too_large")
     text = data.decode("latin-1")
@@ -117,11 +128,12 @@ def parse(data: bytes) -> Parsed:
         raise StepDataError("duplicate_entity_ids")
     sites = []
     for r in recs:
-        if r.types != [ENTITY] or r.arity != [ARITY]:
+        if len(r.types) != 1 or r.types[0] not in spec or r.arity != [spec[r.types[0]][0]]:
             continue
+        idxs = {str(i): i for i in spec[r.types[0]][1]}
         for (path, _, _, _), (a, b) in zip(r.strings, r.spans):
-            if path == str(NAME_INDEX):
-                sites.append(OrgSite(r.eid, a, b, decode_literal(text[a + 1:b - 1])))
+            if path in idxs:
+                sites.append(OrgSite(r.eid, a, b, decode_literal(text[a + 1:b - 1]), r.types[0], idxs[path]))
     return Parsed(text, recs, data_start, sites)
 
 
@@ -182,10 +194,37 @@ def _fail(res: StepDataResult, reason: str) -> StepDataResult:
     return res
 
 
+def _split_pseudonym(new: str) -> tuple[str, str]:
+    """Pseudonym -> (first, last) for PERSON first_name/last_name pairs."""
+    head, _, tail = new.partition(" ")
+    return (head, tail) if tail else ("", new)
+
+
 def plan(p: Parsed, org_map: dict[str, str]) -> tuple[list[tuple[OrgSite, str, int]], int]:
     index = {k: i for i, k in enumerate(org_map)}
     edits, bad = [], 0
+    done: set[int] = set()
+    # PERSON split names: last/first jointly equal to an approved full name (exact, whitespace-normalised join)
+    by_eid: dict[int, dict[int, OrgSite]] = {}
     for s in p.sites:
+        if s.etype == "PERSON":
+            by_eid.setdefault(s.eid, {})[s.pidx] = s
+    for eid, ps in by_eid.items():
+        last, first = ps.get(1), ps.get(2)
+        if not last or not first or not last.value or not first.value:
+            continue
+        if last.value in org_map or first.value in org_map:
+            continue  # handled individually below
+        for joined in (f"{first.value} {last.value}", f"{last.value}, {first.value}", f"{last.value} {first.value}"):
+            if joined in org_map:
+                f_new, l_new = _split_pseudonym(org_map[joined])
+                edits.append((first, f_new, index[joined]))
+                edits.append((last, l_new, index[joined]))
+                done.update((first.start, last.start))
+                break
+    for s in p.sites:
+        if s.start in done:
+            continue
         if s.value is None:
             bad += 1
             continue
@@ -194,8 +233,33 @@ def plan(p: Parsed, org_map: dict[str, str]) -> tuple[list[tuple[OrgSite, str, i
     return edits, bad
 
 
+def transform_identities(src: str | Path, dst: str | Path, id_map: dict[str, str], *,
+                         overwrite: bool = False) -> StepDataResult:
+    """Attempt 2: replace exact approved values at every :data:`IDENTITY_SPEC` position."""
+    safe = {k: v for k, v in id_map.items() if isinstance(k, str) and k and k != v and st._safe_new(v)}
+    return transform_organizations(src, dst, safe, overwrite=overwrite, spec=IDENTITY_SPEC)
+
+
+def identity_values(path: str | Path) -> list[tuple[str, str]]:
+    """``(location, exact value)`` for every IDENTITY_SPEC site plus joined PERSON names (discovery)."""
+    p = parse(Path(path).read_bytes(), IDENTITY_SPEC)
+    out, persons = [], {}
+    for s in p.sites:
+        if s.value is None:
+            continue
+        out.append((f"{s.etype}.{s.pidx}", s.value))
+        if s.etype == "PERSON":
+            persons.setdefault(s.eid, {})[s.pidx] = s.value
+    for ps in persons.values():
+        if ps.get(1) and ps.get(2):
+            out.append(("PERSON.full", f"{ps[2]} {ps[1]}"))
+            out.append(("PERSON.full", f"{ps[1]}, {ps[2]}"))
+            out.append(("PERSON.full", f"{ps[1]} {ps[2]}"))
+    return out
+
+
 def transform_organizations(src: str | Path, dst: str | Path, org_map: dict[str, str], *,
-                            overwrite: bool = False) -> StepDataResult:
+                            overwrite: bool = False, spec: dict = ORG_SPEC) -> StepDataResult:
     """Replace ``ORGANIZATION.name`` literals whose exact decoded value is in ``org_map``.
 
     ``dst`` is written atomically, and only for ``transformed_validated``."""
@@ -214,7 +278,7 @@ def transform_organizations(src: str | Path, dst: str | Path, org_map: dict[str,
         return _fail(res, "io_error")
     res.source_sha256 = hashlib.sha256(data).hexdigest()
     try:
-        p = parse(data)
+        p = parse(data, spec)
     except StepDataError as exc:
         return _fail(res, str(exc))
     res.entities = len(p.records)
@@ -236,7 +300,7 @@ def transform_organizations(src: str | Path, dst: str | Path, org_map: dict[str,
     pieces.append(p.text[pos:])
     out = "".join(pieces).encode("latin-1")
 
-    reason = _verify(p, out, edits, org_map, res)
+    reason = _verify(p, out, edits, org_map, res, spec)
     if reason:
         return _fail(res, reason)
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -263,9 +327,9 @@ def transform_organizations(src: str | Path, dst: str | Path, org_map: dict[str,
     return res
 
 
-def _verify(p: Parsed, out: bytes, edits, org_map: dict[str, str], res: StepDataResult) -> str:
+def _verify(p: Parsed, out: bytes, edits, org_map: dict[str, str], res: StepDataResult, spec: dict = ORG_SPEC) -> str:
     try:
-        q = parse(out)
+        q = parse(out, spec)
     except StepDataError:
         return "output_not_parseable"
     if q.text[:q.data_start] != p.text[:p.data_start]:

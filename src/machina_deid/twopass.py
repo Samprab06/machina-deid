@@ -311,24 +311,29 @@ def build_identity_map(cat: IdentityCatalog, candidates: list[Candidate]) -> tup
 
 
 def build_org_map(cat: IdentityCatalog, candidates: list[Candidate]) -> tuple[dict[str, str], int]:
-    """Exact decoded DATA ORGANIZATION names -> pseudonym, only where approved under kind ``org``.
-    Returns ``(map, approved_under_other_kind)``; the latter are left unchanged and reported as residual."""
+    """Exact decoded DATA person/organization attribute values -> pseudonym.
+
+    Attempt 2: a value approved under *any* kind (``person``/``org``/manual) is replaced at a DATA
+    identity position (ORGANIZATION id/name, PERSON id/last/first/joined). Attempt 1 required kind ``org``
+    and left ``person``-approved values (e.g. a FILE_NAME author repeated as ORGANIZATION.name) as residual.
+    The pseudonym is the value's single catalog pseudonym, so it stays consistent with header/PDF/DXF.
+    Returns ``(map, unreplaceable_approved)``."""
     out: dict[str, str] = {}
     other = 0
     for c in candidates:
         if c.kind != DATA_ORG_KIND or c.value in out:
             continue
-        hit = cat.approved_pseudonym(c.value, kind="org")
+        hit = cat.approved_pseudonym(c.value)
         if hit is not None and hit[1] != c.value:
             out[c.value] = hit[1]
-        elif cat.approved_pseudonym(c.value) is not None:
+        elif hit is not None:
             other += 1
     return out, other
 
 
 def _transform_step(src: Path, dst: Path, idmap: IdentityMap, org_map: dict[str, str], out, overwrite: bool):
     """Header stage (FILE_NAME, untyped map) then DATA stage (ORGANIZATION.name, typed org map)."""
-    from .step_data_transform import transform_organizations
+    from .step_data_transform import transform_identities as transform_organizations
     from .step_transform import transform_step
     if dst.exists() and not overwrite:
         raise FileExistsError("output exists")
@@ -358,6 +363,27 @@ def _transform_step(src: Path, dst: Path, idmap: IdentityMap, org_map: dict[str,
             return False
         os.replace(stage, dst)
         return True
+
+
+def step_literal_residual(path: Path, values) -> int:
+    """Independent scan: DATA string literals of ``path`` that still contain an approved value
+    (exact substring of the decoded literal). Never edits; -1 if DATA is not parseable."""
+    from .step_data_transform import StepDataError, decode_literal, parse
+    vals = [v for v in values if v]
+    if not vals:
+        return 0
+    try:
+        p = parse(path.read_bytes(), {})
+    except StepDataError:
+        return -1
+    n = 0
+    for r in p.records:
+        for a, b in r.spans:
+            raw = p.text[a + 1:b - 1]
+            lit = decode_literal(raw) or raw
+            if any(v in lit for v in vals):
+                n += 1
+    return n
 
 
 def _independent_pdf_check(src: Path, dst: Path, values: list[str], out) -> bool:
@@ -433,10 +459,14 @@ def transform_file(cat: IdentityCatalog, src: str | Path, dst: str | Path, rel_p
         return out
     cands = [c for d in found for c in d.candidates]
     idmap, st = build_identity_map(cat, cands)
-    org_map, org_other = build_org_map(cat, cands) if fmt == "step" else ({}, 0)
-    out.approved_values = st.approved_values + len(org_map)
+    org_map, org_other = build_org_map(cat, cands) if fmt in ("step", "zip") else ({}, 0)
+    org_map_zip: dict[str, str] = {}
+    if fmt == "zip":  # archive members: DATA-position values join the single member map
+        org_map_zip = {k: v for k, v in org_map.items() if k not in idmap.strings}
+        org_map, org_other = {}, 0
+    out.approved_values = st.approved_values + len(org_map) + len(org_map_zip)
     out.residual_approved = org_other
-    if not idmap.strings and not org_map:
+    if not idmap.strings and not org_map and not org_map_zip:
         out.status, out.reason = "no_approved_identities", "nothing approved for current candidates"
         out.source_unchanged = _sha_file(src) == before
         return out
@@ -457,7 +487,13 @@ def transform_file(cat: IdentityCatalog, src: str | Path, dst: str | Path, rel_p
         elif fmt == "step":
             dst.parent.mkdir(parents=True, exist_ok=True)
             ok = _transform_step(src, dst, idmap, org_map, out, overwrite)
+            if ok:
+                left = step_literal_residual(dst, [*idmap.strings, *org_map])
+                if left > 0:
+                    out.independent_residual["step_data_literal_substring"] = left
         else:
+            if org_map_zip:
+                idmap = IdentityMap(strings={**org_map_zip, **idmap.strings})
             r = ar.transform_zip(src, dst, idmap, overwrite=overwrite)
             ok = r.ok
             flat = list(ar._walk(r.members))

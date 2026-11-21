@@ -181,6 +181,23 @@ def discover_step(path: str | Path, *, include_software: bool = False, include_t
             loc, why = f"step:DATA.ORGANIZATION.name[{k}]", "ISO 10303-41 ORGANIZATION.name in DATA; requires typed org approval"
             if _plausible(value) is None and not _echoes_structure(value, loc, why):  # exact value kept (not stripped) so transform matching is exact
                 out.append(Candidate("org_name", value, loc, "medium", why))
+    if include_data_orgs:
+        # Attempt 2: further identity-bearing DATA positions (ORGANIZATION.id, PERSON id/last/first and
+        # joined full names). Same review-only kind: replaced only when an approval already exists.
+        from .step_data_transform import StepDataError, identity_values
+        try:
+            extra = identity_values(path)
+        except StepDataError:
+            extra = []
+        seen = {c.value for c in out if c.kind == "org_name"}
+        for k, (where, value) in enumerate(extra):
+            if where == "ORGANIZATION.1" or value in seen or not value.strip():
+                continue
+            if _plausible(value) is not None:  # placeholders, numeric ids, too short: never candidates
+                continue
+            seen.add(value)
+            out.append(Candidate("org_name", value, f"step:DATA.{where}[{k}]", "medium",
+                                 "ISO 10303-41 person/organization attribute; requires existing approval"))
     return out
 
 

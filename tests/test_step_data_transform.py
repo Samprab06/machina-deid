@@ -112,7 +112,8 @@ def test_malformed_fails_closed(tmp_path):
 
 
 def test_discovery_review_required_and_placeholders_dropped(tmp_path):
-    cands = [c for c in discover_step(write(tmp_path)) if c.kind == "org_name"]
+    cands = [c for c in discover_step(write(tmp_path)) if c.kind == "org_name"
+             and c.location.startswith("step:DATA.ORGANIZATION.name")]
     assert sorted(c.value for c in cands) == sorted(["Acme Widgets Ltd", "O'Brien \\ Sons", "Ärger GmbH"])
     assert all(tp.auto_decision(c)[0] == "review" for c in cands)
     assert "Acme Widgets Ltd" not in repr(cands)
@@ -128,13 +129,18 @@ def test_twopass_typed_org_approval_required(tmp_path):
         # approved under a non-org kind: not replaced in DATA, counted as residual
         cat.decide("text", "O'Brien \\ Sons", "approved", reason="manual test", source="manual")
         cat.approve("org", "Acme Widgets Ltd", reason="manual test")
+        # attempt 2: approved under any kind is replaced at DATA identity positions (ORG name, PERSON names)
         o = tp.transform_file(cat, src, tmp_path / "o1.stp", "m.stp")
-        assert o.status == "transformed" and o.data_organizations_replaced == 1, o.reason
-        assert o.residual_approved == 1 and o.source_unchanged
+        assert o.status == "transformed" and o.data_organizations_replaced == 3, o.reason
+        assert o.residual_approved == 0 and o.source_unchanged
         b = (tmp_path / "o1.stp").read_bytes()
         pseud = cat.approved_pseudonym("Acme Widgets Ltd", kind="org")[1]
         assert f"#10=ORGANIZATION('ORG-7','{pseud}',".encode() in b
-        assert b"O''Brien" in b and b"#12=PERSON('p1','Acme Widgets Ltd'" in b
+        assert b"O''Brien" not in b and f"#12=PERSON('p1','{pseud}'".encode() in b
+        # geometric label and free-text description are never edited; reported by the independent scan
+        assert b"CARTESIAN_POINT('Acme Widgets Ltd'" in b and b"'Acme Widgets Ltd supplier'" in b
+        assert o.independent_residual.get("step_data_literal_substring") == 2
+        assert not o.fully_clean
         # idempotent second pass on the output
         o2 = tp.transform_file(cat, tmp_path / "o1.stp", tmp_path / "o2.stp", "m.stp")
         assert o2.data_organizations_replaced == 0 and not (tmp_path / "o2.stp").exists()
@@ -148,8 +154,8 @@ def test_twopass_header_and_data_stages_combined(tmp_path):
         assert cat.approved_pseudonym("Acme Widgets Ltd", kind="org") is not None
         o = tp.transform_file(cat, src, tmp_path / "o.stp", "h.stp")
         assert o.status == "transformed", o.reason
-        assert o.data_organizations_replaced == o.changes.step_data_replacements == 1
+        assert o.data_organizations_replaced == o.changes.step_data_replacements == 2
         assert o.changes.step_header_replacements == 1
-        assert o.total_verified_identity_fields_changed == o.fields_replaced == 2
+        assert o.total_verified_identity_fields_changed == o.fields_replaced == 3
         b = (tmp_path / "o.stp").read_bytes()
-        assert b.count(b"Acme Widgets Ltd") == 3  # CARTESIAN_POINT label, PERSON, description: untouched
+        assert b.count(b"Acme Widgets Ltd") == 2  # CARTESIAN_POINT label, description: untouched

@@ -10,3 +10,4 @@ challenge.pdf
 __pycache__/
 *.egg-info/
 .venv/
+bench/
