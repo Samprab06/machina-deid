@@ -6,7 +6,14 @@ All values are fictional. The test checks what the truth says and nothing else:
   * same-identity occurrences (in-doc repeats and cross-document) share one replacement,
   * the unrelated similar name and all technical strings are preserved verbatim.
 Failures are recorded, not fixed by editing the truth.
+
+Region checks are spatial, not layout-assuming: the occurrence region is located in the
+UNMODIFIED synthetic source via PyMuPDF's own search, and the same display-coordinate
+rectangle (page coordinates, so rotated pages need no special casing) is read back in the
+output. We never require the inserted replacement to sit in the same logical line, span,
+or extraction order as the original.
 """
+import io
 import json
 import sqlite3
 import zipfile
@@ -27,6 +34,8 @@ CONF = TRUTH["confusable"]["C1"]["value"]
 ACCOUNT = TRUTH["ole"]["A1"]
 ABS = TRUTH["must_be_absent"]
 KEEP = TRUTH["must_be_preserved"]
+
+PDF_RELS = ("famA/drw-001.pdf", "famA/drw-002.pdf", "famB/sheet-3.pdf")
 
 
 def _pdf(root, rel, draw, meta=None):
@@ -60,7 +69,7 @@ def build_corpus(root: Path) -> dict[str, bytes]:
             p.insert_text((560, y), val, fontsize=8)
         p.insert_text((100, 300), f"PREPARED BY: {P1} AND {CONF}", fontsize=9)
         p.insert_text((100, 280), "DWG 77-042   SCALE 1:2", fontsize=9)
-        p.insert_text((100, 260), "Ø120 ±0.05", fontsize=8)
+        p.insert_text((100, 260), "Ö120 ±0.05", fontsize=8)
 
     def doc2(p):
         p.insert_text((60, 60), f"NOTES: questions to {P1}", fontsize=8)
@@ -108,17 +117,6 @@ def open_pdf(data: bytes):
     return pymupdf.open(stream=data, filetype="pdf")
 
 
-def lines_of(data: bytes):
-    d = open_pdf(data)
-    out = []
-    for p in d:
-        for b in p.get_text("dict")["blocks"]:
-            for l in b.get("lines", []):
-                out.append("".join(s["text"] for s in l["spans"]))
-    d.close()
-    return out
-
-
 def full_text(data: bytes) -> str:
     d = open_pdf(data)
     t = "\n".join(p.get_text() for p in d) + str(d.metadata)
@@ -126,11 +124,38 @@ def full_text(data: bytes) -> str:
     return t
 
 
-def line(data: bytes, prefix: str) -> str | None:
-    for l in lines_of(data):
-        if l.startswith(prefix):
-            return l
-    return None
+def line_tail(data: bytes, anchor: str, pad: float = 3.0, extend: float = 400.0) -> list[str]:
+    """Words on the anchor's display line, to the right of the anchor.
+
+    Coordinates are display/page coordinates, so a 90-degree rotation is handled
+    transparently; no line-grouping assumption is made about how the reader orders
+    the newly inserted text.
+    """
+    d = open_pdf(data)
+    out = []
+    for p in d:
+        for a in p.search_for(anchor):
+            clip = pymupdf.Rect(a.x0, a.y0 - pad, min(a.x1 + extend, p.rect.x1), a.y1 + pad)
+            out += [w[4] for w in p.get_text("words", clip=clip) if w[0] >= a.x1 - 1]
+    d.close()
+    return out
+
+
+def _word_matches(needle: str, word: str) -> bool:
+    """Word-level match tolerant of attached punctuation, but not of hyphenated
+    continuations ('Whittaker-Smith)' matches 'Whittaker-Smith', not 'Whittaker')."""
+    if word == needle:
+        return True
+    if word.startswith(needle) and word[len(needle)] in ")(,.;:[]{}'\"/!?":
+        return True
+    if word.endswith(needle) and word[~len(needle)] in ")(,.;:[]{}'\"/!?":
+        return True
+    return False
+
+
+def is_subseq(needle: list[str], hay: list[str]) -> bool:
+    it = iter(hay)
+    return all(any(_word_matches(n, w) for w in it) for n in needle)
 
 
 @pytest.fixture(scope="module")
@@ -148,8 +173,7 @@ def _outputs(produced):
     led = sqlite3.connect(root / "ops/attempt-1/ledger.sqlite")
     status = dict(led.execute("SELECT path, status FROM output"))
     return out, status, files, {rel: (corp / rel).read_bytes()
-                                for rel in ("famA/drw-001.pdf", "famA/drw-002.pdf", "famB/sheet-3.pdf",
-                                            "cad/part1.sldprt", "cad/part2.sldprt", "bundle/pack.zip")}
+                                for rel in PDF_RELS + ("cad/part1.sldprt", "cad/part2.sldprt", "bundle/pack.zip")}
 
 
 def test_a3_status_transformed(produced):
@@ -162,15 +186,29 @@ def test_a3_status_transformed(produced):
     assert status["cad/part2.sldprt"] == "transformed", status
 
 
+def test_a3_harness_regions_valid(produced):
+    """Sanity over the UNMODIFIED source: the harness locates each occurrence region
+    and reads exactly the expected words there (validates the independent reader
+    before it is applied to outputs)."""
+    _, _, src, _ = _outputs(produced)
+    assert line_tail(src["famA/drw-001.pdf"], "DRAWN") == P1.split(), line_tail(src["famA/drw-001.pdf"], "DRAWN")
+    assert is_subseq(P1.split(), line_tail(src["famA/drw-001.pdf"], "PREPARED"))
+    assert is_subseq(CONF.split(), line_tail(src["famA/drw-001.pdf"], "PREPARED"))
+    assert is_subseq(P1.split(), line_tail(src["famA/drw-002.pdf"], "NOTES:"))
+    assert is_subseq(P1.split(), line_tail(src["famB/sheet-3.pdf"], "APPROVED"))
+    assert is_subseq(CONF.split(), line_tail(src["famB/sheet-3.pdf"], "APPROVED"))
+    assert E1 in full_text(src["famA/drw-002.pdf"])
+
+
 def test_a3_originals_absent(produced):
     """Truth: all four PDF originals must be gone from every PDF output (top level, zip member)."""
     _, status, _, data = _outputs(produced)
-    for rel in ("famA/drw-001.pdf", "famA/drw-002.pdf", "famB/sheet-3.pdf"):
+    for rel in PDF_RELS:
         if status[rel] != "transformed":
             pytest.skip(f"{rel} failed closed (see test_a3_status_transformed)")
         for v in ABS:
             assert v not in full_text(data[rel]), (rel, "original leaked:", v)
-    with zipfile.ZipFile(data["bundle/pack.zip"]) as z:
+    with zipfile.ZipFile(io.BytesIO(data["bundle/pack.zip"])) as z:
         for v in ABS:
             assert v not in full_text(z.read("drw/drw-002.pdf")), ("zip member", "original leaked:", v)
 
@@ -181,6 +219,8 @@ def test_a3_confusable_preserved(produced):
     assert CONF in full_text(data["famA/drw-001.pdf"]), "confusable name was altered (doc1)"
     if status["famB/sheet-3.pdf"] == "transformed":
         assert CONF in full_text(data["famB/sheet-3.pdf"]), "confusable name was altered (rotated page)"
+        assert is_subseq(CONF.split(), line_tail(data["famB/sheet-3.pdf"], "APPROVED")), \
+            "confusable not on the APPROVED line region (rotated page)"
 
 
 def test_a3_technical_preserved(produced):
@@ -189,23 +229,68 @@ def test_a3_technical_preserved(produced):
     t1, t2 = full_text(data["famA/drw-001.pdf"]), full_text(data["famA/drw-002.pdf"])
     assert "DWG 77-042" in t1 and "DWG 77-042" in t2
     assert "SCALE 1:2" in t1 and "SCALE 1:2" in t2
-    assert "Ø120 ±0.05" in t1
+    assert "Ö120 ±0.05" in t1
     if status["famB/sheet-3.pdf"] == "transformed":
         assert "DWG 77-042" in full_text(data["famB/sheet-3.pdf"]), "rotated-page drawing number lost"
 
 
+def _repl_at(data: dict, rel: str, status: dict, anchor: str) -> list[str]:
+    """Replacement words visible at the original occurrence region of ``rel`` in the output."""
+    if status[rel] != "transformed":
+        pytest.skip(f"{rel} failed closed (see test_a3_status_transformed)")
+    tail = line_tail(data[rel], anchor)
+    return [w for w in tail if w]
+
+
 def test_a3_shared_pseudonym(produced):
-    """Truth: same identity -> one replacement across in-doc repeats and across documents."""
-    _, status, _, data = _outputs(produced)
+    """Truth: same identity -> one replacement across in-doc repeats, across documents,
+    and inside the ZIP member. Measured at the original occurrence regions."""
+    _, status, src, data = _outputs(produced)
     if status["famA/drw-001.pdf"] != "transformed":
         pytest.skip("doc1 failed closed (see test_a3_status_transformed)")
-    o1 = data["famA/drw-001.pdf"]
-    note_val = (line(data["famA/drw-002.pdf"], "NOTES: questions to ") or "")[len("NOTES: questions to "):].strip()
-    drawn_val = (line(o1, "DRAWN") or "")[len("DRAWN"):].strip()
-    prep_val = (line(o1, "PREPARED BY: ") or "")[len("PREPARED BY:"):].replace(f"AND {CONF}", "").strip()
-    assert drawn_val and prep_val and note_val, (drawn_val, prep_val, note_val)
-    assert drawn_val not in (P1, CONF)
-    assert drawn_val == prep_val == note_val, (drawn_val, prep_val, note_val)
+
+    # cleanest occurrence: the DRAWN line has nothing after the identity
+    repl = _repl_at(data, "famA/drw-001.pdf", status, "DRAWN")
+    assert repl and repl != P1.split(), ("replacement at DRAWN region", repl)
+
+    # same identity, other regions of the same doc: replacement visible at original spot, original gone
+    tail = _repl_at(data, "famA/drw-001.pdf", status, "PREPARED")
+    assert is_subseq(repl, tail), (repl, tail)
+    assert not is_subseq(P1.split(), tail), ("original still at inline region", tail)
+    assert is_subseq(CONF.split(), tail), ("confusable lost at inline region", tail)
+
+    # cross-document
+    tail2 = _repl_at(data, "famA/drw-002.pdf", status, "NOTES:")
+    assert is_subseq(repl, tail2), (repl, tail2)
+    assert not is_subseq(P1.split(), tail2), tail2
+
+    # rotated page
+    tail3 = _repl_at(data, "famB/sheet-3.pdf", status, "APPROVED")
+    assert is_subseq(repl, tail3), (repl, tail3)
+    assert not is_subseq(P1.split(), tail3), tail3
+    assert is_subseq(CONF.split(), tail3), tail3
+
+    # inside the ZIP member (same doc, same identity)
+    with zipfile.ZipFile(io.BytesIO(data["bundle/pack.zip"])) as z:
+        tailz = [w for w in line_tail(z.read("drw/drw-002.pdf"), "NOTES:") if w]
+    assert is_subseq(repl, tailz), (repl, tailz)
+    assert not is_subseq(P1.split(), tailz), tailz
+
+
+def test_a3_distinct_identities_distinct(produced):
+    """Truth: different identities (P1 person, P2 person, O1 org) get distinct replacements,
+    each visible at its own title-block region."""
+    _, status, src, data = _outputs(produced)
+    if status["famA/drw-001.pdf"] != "transformed":
+        pytest.skip("doc1 failed closed (see test_a3_status_transformed)")
+    r1 = _repl_at(data, "famA/drw-001.pdf", status, "DRAWN")
+    r2 = _repl_at(data, "famA/drw-001.pdf", status, "CHECKED")
+    ro = _repl_at(data, "famA/drw-001.pdf", status, "COMPANY")
+    assert r2 and r2 != P2.split(), r2
+    assert ro and ro != O1.split(), ro
+    assert r1 != r2, (r1, r2)
+    assert r1 != ro, (r1, ro)
+    assert r2 != ro, (r2, ro)
 
 
 def test_a3_annot_and_meta(produced):
@@ -235,16 +320,33 @@ def test_a3_ole_shared_alias(produced):
     assert a1 == a2, (a1, a2)
     assert ACCOUNT.encode() not in data["cad/part1.sldprt"]
     assert ACCOUNT.encode("utf-16-le") not in data["cad/part1.sldprt"]
-    with zipfile.ZipFile(data["bundle/pack.zip"]) as z:
+    with zipfile.ZipFile(io.BytesIO(data["bundle/pack.zip"])) as z:
         assert ole_props(z.read("cad/asm.sldasm")) == a1
         assert z.read("readme.txt") == b"plain notes"
 
 
-def test_a3_rotated_page(produced):
-    """Truth: identity on the 90-degree page is replaced with the same pseudonym as everywhere else."""
-    _, status, _, data = _outputs(produced)
-    if status["famB/sheet-3.pdf"] != "transformed":
-        pytest.skip("rotated page failed closed (see test_a3_status_transformed)")
-    note_val = (line(data["famA/drw-002.pdf"], "NOTES: questions to ") or "")[len("NOTES: questions to "):].strip()
-    appr = (line(data["famB/sheet-3.pdf"], "APPROVED ") or "")[len("APPROVED "):].replace(f"(not {CONF})", "").strip()
-    assert appr and appr == note_val, (appr, note_val)
+def test_a3_zip_inventory_preserved(produced):
+    """Truth: the archive keeps its member list; untouched members keep their CRC/content,
+    transformed members carry the same replacements as their top-level counterparts."""
+    _, status, src, data = _outputs(produced)
+    with zipfile.ZipFile(io.BytesIO(src["bundle/pack.zip"])) as zo, \
+            zipfile.ZipFile(io.BytesIO(data["bundle/pack.zip"])) as zn:
+        names_o = [i.filename for i in zo.infolist()]
+        names_n = [i.filename for i in zn.infolist()]
+        assert names_o == names_n, (names_o, names_n)
+        ro, rn = zo.getinfo("readme.txt"), zn.getinfo("readme.txt")
+        assert ro.CRC == rn.CRC, ("readme CRC changed", ro.CRC, rn.CRC)
+        assert zn.read("readme.txt") == b"plain notes"
+        assert zo.read("readme.txt") == zn.read("readme.txt")
+        for name in names_o:
+            assert zo.getinfo(name).compress_type == zn.getinfo(name).compress_type
+    if status["bundle/pack.zip"] == "transformed":
+        with zipfile.ZipFile(io.BytesIO(data["bundle/pack.zip"])) as z:
+            mem = z.read("drw/drw-002.pdf")
+        top = data["famA/drw-002.pdf"]
+        for v in ABS:
+            assert v not in full_text(mem), (v,)
+        assert not is_subseq(P1.split(), line_tail(mem, "NOTES:"))
+        assert is_subseq(_repl_at(data, "famA/drw-002.pdf", status, "NOTES:"), line_tail(mem, "NOTES:"))
+        assert line_tail(mem, "NOTES:") == line_tail(top, "NOTES:"), \
+            "zip member replacement differs from top-level doc2"
