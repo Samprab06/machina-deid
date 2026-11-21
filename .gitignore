@@ -1,0 +1,12 @@
+input/
+work/
+output/
+attempts/
+manifest.tsv
+challenge.pdf
+*.mapping.sqlite
+.env
+.env.*
+__pycache__/
+*.egg-info/
+.venv/
