@@ -144,3 +144,14 @@ def test_corpus_lookup_does_not_replace_bare_single_words(tmp_path):
             assert len(edits) == 1 and edits[0].source == "inline"
     finally:
         resolver.close()
+
+
+def test_role_scanner_recognizes_localized_labels_and_names():
+    from machina_deid.pdf_titleblock import page_lines, scan_page_lines
+
+    with pymupdf.open() as doc:
+        page = doc.new_page()
+        page.insert_text((100, 100), "Geprüft von: Jörg Weiß")
+        page.insert_text((100, 200), "Vérifié par: Élodie Martin")
+        findings = scan_page_lines(page_lines(page))
+        assert {f.value for f in findings if f.role == "checked"} == {"Jörg Weiß", "Élodie Martin"}

@@ -169,3 +169,46 @@ def test_reproducible_package_and_provenance(produced, tmp_path):
     p2 = json.loads((tmp_path / "attempts/attempt-1/code/PROVENANCE.json").read_text())
     for k in ("entity_map_digest", "catalog_digest", "output_manifest_sha256", "outcomes"):
         assert p1[k] == p2[k], k
+
+
+def test_frozen_person_alias_shares_width_constrained_ole_token(tmp_path):
+    from machina_deid.pdf_entities import EntityMapBuilder, Resolver
+    from machina_deid.scope import OLE_SOURCE, Obs, ole_alias_key
+
+    secret = b"test-root-allocation-key"
+    builder = EntityMapBuilder(secret, ole_alias_key=ole_alias_key(secret))
+    builder.add_document("family/full.pdf", [Obs("person", "Jane Doe", "label_right")])
+    builder.add_document("family/short.pdf", [Obs("person", "J. Doe", "label_right")])
+    builder.add_document("family/doc.slddrw", [Obs("account", "Jane Doe", OLE_SOURCE)])
+    path = tmp_path / "map.sqlite"
+    builder.freeze(path)
+    resolver = Resolver(secret, path)
+    try:
+        full, short = resolver.entry("Jane Doe"), resolver.entry("J. Doe")
+        assert full.status == short.status == "ok"
+        assert full.pseudonym == short.pseudonym == full.fitted == short.fitted
+        assert len(full.pseudonym) == len("Jane Doe")
+    finally:
+        resolver.close()
+
+
+def test_frozen_map_refuses_colliding_tokens_for_distinct_roots(tmp_path):
+    from machina_deid.pdf_entities import EntityMapBuilder, Resolver
+    from machina_deid.scope import Obs
+
+    class Catalog:
+        def approved_pseudonym(self, _value):
+            return "person", "Shared Synthetic Alias"
+
+    secret = b"test-token-collision-key"
+    builder = EntityMapBuilder(secret, Catalog())
+    builder.add_document("f/first.pdf", [Obs("person", "Jane Doe", "label_right")])
+    builder.add_document("f/second.pdf", [Obs("person", "Bob Builder", "label_right")])
+    path = tmp_path / "map.sqlite"
+    assert builder.freeze(path)["pseudonym_shared_across_roots"] > 0
+    resolver = Resolver(secret, path)
+    try:
+        assert resolver.resolve("person", "Jane Doe")[0] is None
+        assert resolver.resolve("person", "Bob Builder")[0] is None
+    finally:
+        resolver.close()
