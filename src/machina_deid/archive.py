@@ -202,9 +202,9 @@ def _transform_member(kind: str, data: bytes, idmap: IdentityMap, work: Path, re
     src.write_bytes(data)
     try:
         if kind == "step":
-            from .step_transform import transform_step
-            from .step_data_transform import transform_identities
-            r = transform_step(src, dst, idmap)
+            from .step_transform import PASS2_FIELDS, transform_step
+            from .step_data_transform import transform_descriptive, transform_identities
+            r = transform_step(src, dst, idmap, fields=PASS2_FIELDS)
             rep.replacements = dict(r.replacements)
             if r.outcome in ("transformed_validated", "inspected_no_identifiers"):
                 stage = dst if r.outcome == "transformed_validated" else src
@@ -216,6 +216,16 @@ def _transform_member(kind: str, data: bytes, idmap: IdentityMap, work: Path, re
                     d = transform_identities(stage, dd, dict(idmap.strings))
                     if d.outcome == "transformed_validated":
                         rep.changes.step_data_replacements = sum(d.replacements.values())
+                        os.replace(dd, dst)
+                        stage = dst
+                finally:
+                    dd.unlink(missing_ok=True)
+                # Attempt 2b: scoped descriptive product-structure literals (boundary-aware, verified)
+                dd = work / f"{uuid.uuid4().hex}.descr"
+                try:
+                    g = transform_descriptive(stage, dd, dict(idmap.strings))
+                    if g.outcome == "transformed_validated":
+                        rep.changes.step_descriptive_replacements = sum(g.replacements.values())
                         os.replace(dd, dst)
                         stage = dst
                 finally:

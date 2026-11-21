@@ -35,6 +35,11 @@ CHUNK = 1 << 20
 FILE_NAME_FIELDS = ("name", "timestamp", "author", "organization", "preprocessor", "originating_system",
                     "authorization")
 DEFAULT_FIELDS = ("name", "author", "organization", "originating_system", "authorization")
+# Attempt 2b (pass-2 pipeline): ``preprocessor_version`` is free informational text (ISO 10303-21 §8.2.2);
+# exporters frequently repeat the organization/user there. Approved values found there were previously
+# counted as residual ("mapped_present_in_unrequested_fields") but never replaced. ``time_stamp`` stays
+# excluded (never edited; a hit there is still reported).
+PASS2_FIELDS = DEFAULT_FIELDS + ("preprocessor",)
 
 OUTCOMES = ("transformed_validated", "inspected_no_identifiers", "unsupported_passthrough",
             "identifiers_unmodifiable", "failed_validation")

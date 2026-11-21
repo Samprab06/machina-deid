@@ -132,14 +132,16 @@ def test_twopass_typed_org_approval_required(tmp_path):
         # attempt 2: approved under any kind is replaced at DATA identity positions (ORG name, PERSON names)
         o = tp.transform_file(cat, src, tmp_path / "o1.stp", "m.stp")
         assert o.status == "transformed" and o.data_organizations_replaced == 3, o.reason
+        assert o.changes.step_descriptive_replacements == 1  # attempt 2b: ORGANIZATION.description
         assert o.residual_approved == 0 and o.source_unchanged
         b = (tmp_path / "o1.stp").read_bytes()
         pseud = cat.approved_pseudonym("Acme Widgets Ltd", kind="org")[1]
         assert f"#10=ORGANIZATION('ORG-7','{pseud}',".encode() in b
         assert b"O''Brien" not in b and f"#12=PERSON('p1','{pseud}'".encode() in b
-        # geometric label and free-text description are never edited; reported by the independent scan
-        assert b"CARTESIAN_POINT('Acme Widgets Ltd'" in b and b"'Acme Widgets Ltd supplier'" in b
-        assert o.independent_residual.get("step_data_literal_substring") == 2
+        # geometric label never edited; reported by the independent scan. Attempt 2b: the scoped
+        # ORGANIZATION.description gets a boundary-aware substring replacement.
+        assert b"CARTESIAN_POINT('Acme Widgets Ltd'" in b and f"'{pseud} supplier'".encode() in b
+        assert o.independent_residual.get("step_data_literal_substring") == 1
         assert not o.fully_clean
         # idempotent second pass on the output
         o2 = tp.transform_file(cat, tmp_path / "o1.stp", tmp_path / "o2.stp", "m.stp")
@@ -156,6 +158,7 @@ def test_twopass_header_and_data_stages_combined(tmp_path):
         assert o.status == "transformed", o.reason
         assert o.data_organizations_replaced == o.changes.step_data_replacements == 2
         assert o.changes.step_header_replacements == 1
-        assert o.total_verified_identity_fields_changed == o.fields_replaced == 3
+        assert o.changes.step_descriptive_replacements == 1  # attempt 2b: ORGANIZATION.description
+        assert o.total_verified_identity_fields_changed == o.fields_replaced == 4
         b = (tmp_path / "o.stp").read_bytes()
-        assert b.count(b"Acme Widgets Ltd") == 2  # CARTESIAN_POINT label, description: untouched
+        assert b.count(b"Acme Widgets Ltd") == 1  # CARTESIAN_POINT label: untouched

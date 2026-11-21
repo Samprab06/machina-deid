@@ -12,6 +12,9 @@ class TransformCounts:
     step_header_replacements: int = 0
     step_data_replacements: int = 0
     dxf_replacements: int = 0
+    step_descriptive_replacements: int = 0  # attempt 2b: scoped PRODUCT/structure descriptive literals
+    mesh_header_replacements: int = 0  # attempt 2b: STL header/solid name
+    svg_metadata_replacements: int = 0  # attempt 2b: SVG RDF/Dublin Core metadata
 
     @property
     def total(self) -> int:

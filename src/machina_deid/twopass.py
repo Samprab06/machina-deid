@@ -344,15 +344,16 @@ def build_org_map(cat: IdentityCatalog, candidates: list[Candidate]) -> tuple[di
 
 def _transform_step(src: Path, dst: Path, idmap: IdentityMap, org_map: dict[str, str], out, overwrite: bool):
     """Header stage (FILE_NAME, untyped map) then DATA stage (ORGANIZATION.name, typed org map)."""
+    from .step_data_transform import transform_descriptive
     from .step_data_transform import transform_identities as transform_organizations
-    from .step_transform import transform_step
+    from .step_transform import PASS2_FIELDS, transform_step
     if dst.exists() and not overwrite:
         raise FileExistsError("output exists")
     stage = src
     with tempfile.TemporaryDirectory(prefix="deid-step-", dir=dst.parent) as work:
         if idmap.strings:
             mid = Path(work) / "header.stp"
-            r = transform_step(src, mid, idmap)
+            r = transform_step(src, mid, idmap, fields=PASS2_FIELDS)
             out.residual_approved += _sum(r.unmodifiable) + _sum(r.mapped_present_in_unrequested_fields)
             if r.outcome == "transformed_validated":
                 out.changes.step_header_replacements = _sum(r.replacements)
@@ -361,17 +362,29 @@ def _transform_step(src: Path, dst: Path, idmap: IdentityMap, org_map: dict[str,
                 out.reason = r.reason or r.outcome
                 return False
         if org_map:
-            d = transform_organizations(stage, dst, org_map, overwrite=overwrite)
+            mid = Path(work) / "data.stp"
+            d = transform_organizations(stage, mid, org_map)
             out.residual_approved += d.unmodifiable
             if d.outcome == "transformed_validated":
                 out.changes.step_data_replacements = _sum(d.replacements)
-                return True
-            if not d.ok:
+                stage = mid
+            elif not d.ok:
                 out.reason = "data:" + (d.reason or d.outcome)
                 return False
+        values = {**org_map, **idmap.strings}
+        if values:
+            # Attempt 2b: this file's own approved values inside scoped descriptive product-structure
+            # literals. A failure here never discards the verified identity stages above.
+            mid = Path(work) / "descr.stp"
+            g = transform_descriptive(stage, mid, values)
+            if g.outcome == "transformed_validated":
+                out.changes.step_descriptive_replacements = _sum(g.replacements)
+                stage = mid
         if stage is src:
             out.reason = "no_exact_match_in_transformable_fields"
             return False
+        if dst.exists() and not overwrite:
+            raise FileExistsError("output exists")
         os.replace(stage, dst)
         return True
 

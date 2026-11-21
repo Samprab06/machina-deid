@@ -226,7 +226,10 @@ def plan(p: Parsed, org_map: dict[str, str]) -> tuple[list[tuple[OrgSite, str, i
         if s.start in done:
             continue
         if s.value is None:
-            bad += 1
+            # attempt 2b: an undecodable literal is residual only if it actually carries a mapped value
+            # (utf-8/cp1252 raw form); unapproved undecodable names were miscounted as residual before.
+            if raw_contains_any(p.text[s.start + 1:s.end - 1], org_map):
+                bad += 1
             continue
         if s.value in org_map:  # exact decoded string equality only
             edits.append((s, org_map[s.value], index[s.value]))
@@ -364,3 +367,133 @@ def _verify(p: Parsed, out: bytes, edits, org_map: dict[str, str], res: StepData
     if any(s.value in org_map and s.value not in reintroduced for s in q.sites):
         return "mapped_original_remains"
     return ""
+
+
+# ---------------------------------------------------------------- attempt 2b: scoped descriptive fields
+#
+# Bounded, boundary-aware substring replacement of *this file's own approved values* (the exact strings
+# already looked up for FILE_NAME / identity positions) inside descriptive string attributes of
+# product-structure entities only. Geometry/topology labels, units, representation items and every
+# non-listed entity are never edited. Same verifier as above (graph, numeric tokens, skeleton, unplanned
+# literals) plus an independent post-check that no planned literal still has a boundary match.
+DESCRIPTIVE_SPEC = {
+    "PRODUCT": (4, (0, 1, 2)),                                            # id, name, description
+    "PRODUCT_DEFINITION": (4, (0, 1)),                                    # id, description
+    "PRODUCT_DEFINITION_FORMATION": (3, (0, 1)),                          # id, description
+    "PRODUCT_DEFINITION_FORMATION_WITH_SPECIFIED_SOURCE": (4, (0, 1)),    # id, description
+    "NEXT_ASSEMBLY_USAGE_OCCURRENCE": (6, (1, 2)),                        # name, description
+    "ORGANIZATION": (3, (2,)),                                            # description
+}
+MIN_SUBSTRING = 3
+
+
+def _boundary_pattern(values) -> re.Pattern | None:
+    keys = sorted({v for v in values if len(v) >= MIN_SUBSTRING and any(c.isalpha() for c in v)},
+                  key=lambda k: -len(k))
+    if not keys:
+        return None
+    # boundary: no letter/digit immediately before/after (underscore, punctuation, space, ends count)
+    return re.compile(r"(?<![^\W_])(?:" + "|".join(re.escape(k) for k in keys) + r")(?![^\W_])")
+
+
+def boundary_hits(text: str, values) -> int:
+    pat = _boundary_pattern(values)
+    return len(pat.findall(text)) if pat and text else 0
+
+
+def transform_descriptive(src: str | Path, dst: str | Path, value_map: dict[str, str], *,
+                          overwrite: bool = False) -> StepDataResult:
+    """Replace boundary-delimited occurrences of ``value_map`` keys inside :data:`DESCRIPTIVE_SPEC`
+    literals. Literals with escape directives/backslashes, raw 8-bit bytes, or a non-ASCII result are
+    left unchanged and counted in ``unmodifiable`` (only when they contain a hit)."""
+    src, dst = Path(src), Path(dst)
+    if src.resolve() == dst.resolve():
+        raise ValueError("output path must differ from source path")
+    if dst.exists() and not overwrite:
+        raise FileExistsError("output exists")
+    vmap = {k: v for k, v in value_map.items() if isinstance(k, str) and k and k != v and st._safe_new(v)}
+    pat = _boundary_pattern(vmap)
+    res = StepDataResult()
+    try:
+        data = src.read_bytes()
+    except OSError:
+        return _fail(res, "io_error")
+    res.source_sha256 = hashlib.sha256(data).hexdigest()
+    try:
+        p = parse(data, DESCRIPTIVE_SPEC)
+    except StepDataError as exc:
+        return _fail(res, str(exc))
+    res.entities, res.organizations_in_scope = len(p.records), len(p.sites)
+    res.references = sum(len(r.refs) for r in p.records)
+    index = {k: i for i, k in enumerate(vmap)}
+    edits = []
+    if pat is not None:
+        for s in p.sites:
+            if s.value is None or not pat.search(s.value):
+                continue
+            raw = p.text[s.start + 1:s.end - 1]
+            new = pat.sub(lambda m: vmap[m.group(0)], s.value)
+            if "\\" in raw or not raw.isascii() or not new.isascii() or not st._safe_new(new):
+                res.unmodifiable += 1
+                continue
+            edits.append((s, new, index[pat.search(s.value).group(0)]))
+    if not edits:
+        if res.unmodifiable:
+            res.outcome, res.reason = "identifiers_unmodifiable", "descriptive_literal_not_rewritable"
+        else:
+            res.outcome, res.ok, res.reason = "inspected_no_identifiers", True, "no_descriptive_match"
+        return res
+    pieces, pos = [], 0
+    for s, new, _ in sorted(edits, key=lambda e: e[0].start):
+        pieces += [p.text[pos:s.start], "'" + st._escape(new) + "'"]
+        pos = s.end
+    pieces.append(p.text[pos:])
+    out = "".join(pieces).encode("latin-1")
+    reason = _verify(p, out, edits, {}, res, DESCRIPTIVE_SPEC)
+    if not reason:
+        q = parse(out, DESCRIPTIVE_SPEC)
+        planned = {s.start for s, _, _ in edits}
+        keep = _boundary_pattern([k for k in vmap if k not in vmap.values()])
+        for a, b in zip(p.sites, q.sites):
+            if a.start in planned and keep is not None and b.value is not None and keep.search(b.value):
+                reason = "mapped_original_remains"
+                break
+    if reason:
+        return _fail(res, reason)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f".{dst.name}.{uuid.uuid4().hex[:10]}.partial")
+    try:
+        with tmp.open("wb") as f:
+            f.write(out)
+            f.flush()
+            os.fsync(f.fileno())
+        if tmp.read_bytes() != out:
+            return _fail(res, "output_readback_mismatch")
+        if hashlib.sha256(src.read_bytes()).hexdigest() != res.source_sha256:
+            return _fail(res, "source_changed_during_transform")
+        os.replace(tmp, dst)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    res.outcome, res.ok, res.output_written = "transformed_validated", True, True
+    res.output_sha256 = hashlib.sha256(out).hexdigest()
+    for _, _, i in edits:
+        res.replacements[i] = res.replacements.get(i, 0) + 1
+    return res
+
+
+def raw_contains_any(raw: str, values) -> bool:
+    """Latin-1 view ``raw`` contains any value in utf-8 or cp1252 byte form, or in a best-effort
+    directive decoding (case-sensitive). Conservative: used to decide whether an undecodable literal
+    is a genuine residual."""
+    best = st._decode_directives(st._split_content(raw)[0])
+    if any(v and v in best for v in values):
+        return True
+    for v in values:
+        for enc in ("utf-8", "cp1252"):
+            try:
+                if v and v.encode(enc).decode("latin-1") in raw:
+                    return True
+            except UnicodeEncodeError:
+                continue
+    return False
