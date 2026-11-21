@@ -1,9 +1,11 @@
 """Attempt 2c coverage fixes: links, Info/XMP, visible residue, layouts, OCR, QA buckets (synthetic only)."""
+from types import SimpleNamespace
+
 import pymupdf
 import pytest
 
 from machina_deid.pdf_entities import Resolver
-from machina_deid.pdf_links import verify_links
+from machina_deid.pdf_links import raw_link_uri, rewrite_link_actions, verify_links
 from machina_deid.pdf_residual import inspect_pdf
 from machina_deid.pdf_scoped import transform_pdf_scoped
 
@@ -79,6 +81,141 @@ def test_link_verifier_is_independent_of_writer(tmp_path):
         o = pymupdf.open(tmp_path / "o.pdf")
         assert verify_links(src, o, [])[code] >= 1
         o.close()
+
+
+@pytest.mark.parametrize("indirect", [False, True], ids=["direct", "indirect"])
+@pytest.mark.parametrize("scheme", ["http", "https"])
+def test_link_verifier_checks_exact_uri_action(indirect, scheme):
+    pairs = {"http://www.acme.example/catalog": "replacement.example", "Jane Doe": "Person-123"}
+    original = f"{scheme}://www.acme.example:8080/catalog/Jane%20Doe?part=a%2fb&view=full#top"
+    expected = f"{scheme}://replacement.example:8080/catalog/Person-123?part=a%2fb&view=full#top"
+    unrelated = f"{scheme}://www.acme.example:8080/catalogue/Janet%20Doe?part=a%2fb&view=full#top"
+
+    def make_pdf(uri, control=unrelated):
+        with pymupdf.open() as doc:
+            page = doc.new_page()
+            for y, target in ((10, uri), (30, control)):
+                page.insert_link({"kind": pymupdf.LINK_URI, "from": pymupdf.Rect(10, y, 50, y + 10),
+                                  "uri": target})
+            if indirect:
+                for xref, _, _ in doc.reload_page(page).annot_xrefs():
+                    action = doc.get_new_xref()
+                    doc.update_object(action, doc.xref_get_key(xref, "A")[1])
+                    doc.xref_set_key(xref, "A", f"{action} 0 R")
+            return doc.tobytes()
+
+    source = make_pdf(original)
+    with pymupdf.open(stream=source) as src:
+        with pymupdf.open(stream=make_pdf(expected)) as out:
+            assert not verify_links(src, out, pairs)
+        with pymupdf.open(stream=make_pdf(expected, unrelated.replace("view=full", "view=other"))) as out:
+            assert verify_links(src, out, pairs)["link_action_changed"] == 1
+        for wrong_uri in (
+            original,
+            expected.replace("/catalog/", "/other/"),
+            expected.replace("view=full", "view=other"),
+            expected.replace("replacement.example", "other.example"),
+            expected.replace("Person-123", "Person-456"),
+            expected.replace(":8080", ":8081"),
+            expected.replace("#top", "#bottom"),
+            expected.replace(f"{scheme}:", "mailto:", 1),
+        ):
+            with pymupdf.open(stream=make_pdf(wrong_uri)) as out:
+                assert verify_links(src, out, pairs)["link_action_changed"] == 1
+
+        with pymupdf.open(stream=source) as written:
+            sub = SimpleNamespace(pairs=list(pairs.items()))
+            assert rewrite_link_actions(written, sub) == 2
+            with pymupdf.open(stream=written.tobytes()) as out:
+                assert [raw_link_uri(out, xref) for xref, _, _ in out[0].annot_xrefs()] == [expected, unrelated]
+                assert not verify_links(src, out, pairs)
+
+
+@pytest.mark.parametrize("indirect_action", [False, True], ids=["direct-A", "indirect-A"])
+@pytest.mark.parametrize("hex_string", [False, True], ids=["literal", "hex"])
+def test_link_rewrite_indirect_uri_string(indirect_action, hex_string):
+    original = "mailto:jane%40example.test?subject=Parts%20(a)&body=A%2fb"
+    expected = "mailto:person%40replacement.test?subject=Parts%20(a)&body=A%2fb"
+    control = "mailto:janet%40example.test?subject=Keep%20this&body=B%2fc"
+    pairs = {"jane@example.test": "person@replacement.test"}
+    with pymupdf.open() as doc:
+        page = doc.new_page()
+        for y, uri in ((10, original), (30, control)):
+            page.insert_link({"kind": pymupdf.LINK_URI, "from": pymupdf.Rect(10, y, 50, y + 10),
+                              "uri": uri})
+        link, other = [xref for xref, _, _ in doc.reload_page(page).annot_xrefs()]
+        scalar = doc.get_new_xref()
+        doc.update_object(scalar, f"<{original.encode('ascii').hex()}>" if hex_string
+                          else r"(mailto:jane%40example.test?subject=Parts%20\(a\)&body=A%2fb)")
+        control_scalar = doc.get_new_xref()
+        doc.update_object(control_scalar, pymupdf.get_pdf_str(control))
+        doc.xref_set_key(other, "A/URI", f"{control_scalar} 0 R")
+        doc.xref_set_key(link, "A/URI", f"{scalar} 0 R")
+        doc.xref_set_key(link, "A/IsMap", "false")
+        catalog = doc.pdf_catalog()
+        doc.xref_set_key(catalog, "FixtureSharedURI", f"{scalar} 0 R")
+        action = link
+        key = "A/"
+        if indirect_action:
+            action = doc.get_new_xref()
+            doc.update_object(action, doc.xref_get_key(link, "A")[1])
+            doc.xref_set_key(link, "A", f"{action} 0 R")
+            doc.xref_set_key(catalog, "FixtureSharedAction", f"{action} 0 R")
+            key = ""
+        source = doc.tobytes()
+
+    with pymupdf.open(stream=source) as src, pymupdf.open(stream=source) as written:
+        assert src.xref_get_key(action, key + "URI") == ("xref", f"{scalar} 0 R")
+        assert raw_link_uri(src, link) == original
+        assert rewrite_link_actions(written, SimpleNamespace(pairs=list(pairs.items()))) == 1
+        with pymupdf.open(stream=written.tobytes()) as out:
+            assert not verify_links(src, out, pairs)
+            assert [raw_link_uri(out, xref) for xref in (link, other)] == [expected, control]
+            assert out.xref_get_key(other, "A/URI") == ("xref", f"{control_scalar} 0 R")
+            assert out.xref_get_key(catalog, "FixtureSharedURI") == ("xref", f"{scalar} 0 R")
+            assert out.xref_object(scalar) == src.xref_object(scalar)
+            if indirect_action:
+                typ, ref = out.xref_get_key(link, "A")
+                assert typ == "xref"
+                clone = int(ref.split()[0])
+                assert clone != action
+                assert out.xref_get_key(catalog, "FixtureSharedAction") == ("xref", f"{action} 0 R")
+                assert out.xref_object(action) == src.xref_object(action)
+                action = clone
+            assert out.xref_get_key(action, key + "URI") == ("string", expected)
+            assert out.xref_get_key(action, key + "IsMap") == ("bool", "false")
+
+
+@pytest.mark.parametrize("invalid", ["dangling", "generation", "chain", "dict", "stream", "name"])
+def test_link_rewrite_rejects_invalid_uri_xrefs(invalid):
+    uri = "mailto:jane@example.test"
+    pairs = {"jane@example.test": "person@replacement.test"}
+    with pymupdf.open() as doc:
+        page = doc.new_page()
+        page.insert_link({"kind": pymupdf.LINK_URI, "from": pymupdf.Rect(10, 10, 50, 20), "uri": uri})
+        link, _, _ = doc.reload_page(page).annot_xrefs()[0]
+        scalar = doc.get_new_xref()
+        doc.update_object(scalar, pymupdf.get_pdf_str(uri))
+        target = doc.get_new_xref()
+        if invalid == "dangling":
+            target = doc.xref_length() + 10
+        elif invalid == "generation":
+            target = scalar
+        elif invalid == "chain":
+            doc.update_object(target, f"{scalar} 0 R")
+        elif invalid in ("dict", "stream"):
+            doc.update_object(target, f"<< /URI ({uri}) >>")
+            if invalid == "stream":
+                doc.update_stream(target, uri.encode("ascii"))
+        else:
+            doc.update_object(target, f"/{uri}")
+        generation = 1 if invalid == "generation" else 0
+        doc.xref_set_key(link, "A/URI", f"{target} {generation} R")
+        before = doc.xref_object(link)
+        assert raw_link_uri(doc, link) == ""
+        assert rewrite_link_actions(doc, SimpleNamespace(pairs=list(pairs.items()))) == 0
+        assert doc.xref_object(link) == before
+        assert verify_links(doc, doc, pairs)["link_uri_xref_invalid"] == 1
 
 
 # ------------------------------------------------------------------ Info / XMP

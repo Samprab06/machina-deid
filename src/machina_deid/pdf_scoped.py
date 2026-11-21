@@ -591,7 +591,7 @@ def _verify(src, out_path, plans, keep, before, geometry, pairs, res: ScopedResu
         if out.page_count != res.pages or _geometry(out) != geometry:
             res.checks["page_geometry_changed"] += 1
             return "page_geometry_changed"
-        for k, v in verify_links(srcdoc, out, list(pairs)).items():
+        for k, v in verify_links(srcdoc, out, pairs).items():
             res.checks[k] += v
             failed_checks["links_changed"] += v
         for page in out:
