@@ -25,6 +25,7 @@ import hashlib
 import hmac
 import struct
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 MAGIC = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"
 FREESECT, ENDOFCHAIN, FATSECT, DIFSECT = 0xFFFFFFFF, 0xFFFFFFFE, 0xFFFFFFFD, 0xFFFFFFFC
@@ -38,6 +39,7 @@ VT_I2, VT_LPSTR, VT_LPWSTR = 0x02, 0x1E, 0x1F
 SEPS = frozenset("\\/@.")
 SKIP_STREAM_HINTS = ("preview", "thumbnail")  # never written; only reported
 VERIFIED_KINDS = ("property", "cstring", "path_component")
+MIN_PATH_UNITS = 3  # shorter accounts are too ambiguous as bare path/contact tokens (CStrings stay exact)
 
 
 class OleError(Exception):
@@ -406,9 +408,9 @@ def scan(cfb: Cfb, values: list[str], props: list[Prop] | None = None) -> list[H
             for i in _find_all(blob, u):
                 if (e.path, i) in taken:
                     continue
-                if _cstring_ok(blob, i, len(v)):
+                if _cstring_ok(blob, i, len(u) // 2):  # MFC length counts UTF-16 code units
                     kind = "cstring"
-                elif _path_component_ok(blob, i, len(u)):
+                elif len(u) // 2 >= MIN_PATH_UNITS and _path_component_ok(blob, i, len(u)):
                     kind = "path_component"
                 else:
                     kind = "raw_utf16"
@@ -432,25 +434,119 @@ def scan(cfb: Cfb, values: list[str], props: list[Prop] | None = None) -> list[H
 
 _ALNUM = "abcdefghijklmnopqrstuvwxyz0123456789"
 
+# Legacy codepages whose byte width must be preserved per character (single-byte and common DBCS ANSI pages).
+LEGACY_CODECS = ("cp1250", "cp1251", "cp1252", "cp1253", "cp1254", "cp1255", "cp1256", "cp1257", "cp1258",
+                 "cp874", "cp437", "cp850", "cp932", "cp936", "cp949", "cp950")
+
+# Candidate pools by UTF-8 width (filtered further per signature).
+_POOLS = {
+    1: _ALNUM,
+    2: "".join(chr(c) for c in range(0xC0, 0x530) if chr(c).isalpha()),
+    3: "".join(chr(c) for c in range(0x4E00, 0x5200)),
+    4: "".join(chr(c) for c in range(0x20000, 0x20200)),
+}
+
+
+def _bwidth(ch: str, enc: str) -> int | None:
+    try:
+        return len(ch.encode(enc, "strict"))
+    except UnicodeEncodeError:
+        return None
+
+
+def char_signature(ch: str) -> tuple:
+    """Byte width of ``ch`` in UTF-8, UTF-16 and every legacy codepage (None = unencodable)."""
+    return (len(ch.encode("utf-8")), len(ch.encode("utf-16-le")), *(_bwidth(ch, c) for c in LEGACY_CODECS))
+
+
+@lru_cache(maxsize=None)
+def _pool(sig: tuple) -> str:
+    return "".join(c for c in _POOLS.get(sig[0], "") if char_signature(c) == sig)
+
+
+def widths_match(original: str, alias: str) -> bool:
+    """True iff ``alias`` has the same byte length as ``original`` in UTF-8, UTF-16 and each legacy page
+    where the original is encodable (and is encodable wherever the original is)."""
+    if len(original) != len(alias):
+        return False
+    for enc in ("utf-8", "utf-16-le", *LEGACY_CODECS):
+        try:
+            ob = original.encode(enc, "strict")
+        except UnicodeEncodeError:
+            continue
+        try:
+            if len(alias.encode(enc, "strict")) != len(ob):
+                return False
+        except UnicodeEncodeError:
+            return False
+    return True
+
 
 def equal_length_alias(original: str, key: bytes) -> str:
-    """Deterministic keyed alias of exactly ``len(original)`` ASCII characters (works for 1..n chars).
+    """Deterministic keyed alias with the per-character width signature of ``original``.
 
-    Starts with a letter; ASCII so every record encoding (cp*, utf-8, utf-16) keeps the byte length when the
-    original is also single-byte. Callers may supply their own alias instead.
+    Each character is replaced by one with identical UTF-8 bytes, UTF-16 code units and byte width in every
+    ``LEGACY_CODECS`` page (unencodable where the original is), so any record encoding keeps its byte length.
+    ASCII positions get ASCII alnum; the first character is a letter when the original's is ASCII. Separators
+    and whitespace are kept verbatim so token boundaries are unchanged. Raises ``OleError("no_width_alias")``
+    if no replacement exists for some character. Distinct originals are NOT proven to get distinct aliases;
+    callers must check collisions (see ``AliasRegistry``).
     """
     if not original:
         raise OleError("empty_original")
-    out, ctr = "", 0
-    while len(out) < len(original):
-        d = hmac.new(key, f"{ctr}:{original}".encode("utf-8"), hashlib.sha256).digest()
-        out += "".join(_ALNUM[b % 36] for b in d)
-        ctr += 1
-    out = _ALNUM[int.from_bytes(hmac.new(key, original.encode(), hashlib.sha256).digest()[:2], "big") % 26] + out[1:]
-    out = out[:len(original)]
-    if out == original:
-        out = ("z" if original[0] != "z" else "y") + out[1:]
-    return out
+    out = []
+    for i, ch in enumerate(original):
+        if ch in SEPS or ch.isspace() or ch in ":-_":
+            out.append(ch)
+            continue
+        pool = _pool(char_signature(ch))
+        if i == 0 and ord(ch) < 0x80:
+            pool = "".join(c for c in pool if c.isalpha()) or pool
+        if not pool:
+            raise OleError("no_width_alias")
+        d = hmac.new(key, f"{i}:{original}".encode("utf-8"), hashlib.sha256).digest()
+        out.append(pool[int.from_bytes(d[:8], "big") % len(pool)])
+    alias = "".join(out)
+    if alias == original:
+        # flip the first replaceable char to a different pool member
+        for i, ch in enumerate(original):
+            pool = [c for c in _pool(char_signature(ch)) if c != ch]
+            if pool and ch not in SEPS and not ch.isspace():
+                alias = alias[:i] + pool[0] + alias[i + 1:]
+                break
+        else:
+            raise OleError("no_width_alias")
+    assert widths_match(original, alias)
+    return alias
+
+
+class AliasRegistry:
+    """Process-local original->alias map that refuses a second original receiving an existing alias.
+
+    No global uniqueness is claimed; this only detects collisions among values seen by this process (or loaded
+    from a shared config file).
+    """
+
+    def __init__(self, key: bytes, fixed: dict[str, str] | None = None):
+        self.key = key
+        self.fwd: dict[str, str] = {}
+        self.rev: dict[str, str] = {}
+        for o, a in (fixed or {}).items():
+            self._add(o, a)
+
+    def _add(self, o: str, a: str) -> str:
+        if not widths_match(o, a) or o == a:
+            raise OleError("alias_length_mismatch")
+        prev = self.rev.get(a)
+        if prev is not None and prev != o:
+            raise OleError("alias_collision")
+        self.fwd[o], self.rev[a] = a, o
+        return a
+
+    def get(self, original: str) -> str:
+        if original in self.fwd:
+            return self.fwd[original]
+        return self._add(original, equal_length_alias(original, self.key))
 
 
 # ----------------------------------------------------------------------------------------------- transform
@@ -484,7 +580,8 @@ def transform(data: bytes, mapping: dict[str, str], pids=(PID_LASTAUTHOR,)) -> R
     except OleError as exc:
         return Result(data, reason=str(exc))
     for o, a in mapping.items():
-        if not o or len(o) != len(a) or o == a:
+        # char count here; exact byte width is enforced per hit in its actual record encoding below
+        if not o or o == a or len(o) != len(a) or len(o.encode("utf-16-le")) != len(a.encode("utf-16-le")):
             return Result(data, reason="alias_length_mismatch")
     # Only values confirmed by a parsed property are candidates; mapping keys outside are ignored.
     values = sorted({p.value for p in props if p.value in mapping}, key=lambda v: (-len(v), v))

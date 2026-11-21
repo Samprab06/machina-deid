@@ -13,10 +13,10 @@ def summary_info(props: dict[int, tuple[int, object]], codepage: int | None = 12
     """props: pid -> (vt, value). Supports VT_LPSTR(0x1E, str), VT_LPWSTR(0x1F, str), VT_I4(3, int)."""
     items = []
     if codepage is not None:
-        items.append((1, struct.pack("<Ih2x", 2, codepage)))
+        items.append((1, struct.pack("<Ih2x", 2, codepage - 0x10000 if codepage > 0x7FFF else codepage)))
     for pid, (vt, val) in props.items():
         if vt == 0x1E:
-            raw = val.encode(f"cp{codepage}") + b"\0"
+            raw = val.encode("utf-8" if codepage == 65001 else f"cp{codepage}") + b"\0"
             body = struct.pack("<II", vt, len(raw)) + raw
         elif vt == 0x1F:
             raw = val.encode("utf-16-le") + b"\0\0"
@@ -99,7 +99,8 @@ def cfb(streams: dict[str, bytes]) -> bytes:
 
 
 def cstring(s: str) -> bytes:
-    n = len(s)
+    n = len(s.encode("utf-16-le")) // 2  # MFC CString length counts UTF-16 code units
+
     if n < 0xFF:
         p = b"\xFF\xFE\xFF" + bytes([n])
     else:
