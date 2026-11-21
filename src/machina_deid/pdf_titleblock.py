@@ -10,6 +10,7 @@ Findings carry the raw value in memory only (``repr`` is redacted). Nothing here
 """
 from __future__ import annotations
 
+import dataclasses
 import math
 import re
 from dataclasses import dataclass, field
@@ -185,8 +186,10 @@ def _split_lines(lines: list[Line]) -> list[Line]:
             trail = len(seg.rstrip())
             if seg.strip():
                 s0, s1 = start + lead, start + trail
-                out.append(Line(ln.page, ln.text[s0:s1], ln.boxes[s0:s1], ln.dir, ln.size, ln.color, ln.font,
-                                ln.origins[s0] if ln.origins else ln.origin, ln.origins[s0:s1]))
+                extra = {"confs": ln.confs[s0:s1]} if getattr(ln, "confs", None) else {}
+                out.append(dataclasses.replace(ln, text=ln.text[s0:s1], boxes=ln.boxes[s0:s1],
+                                               origin=ln.origins[s0] if ln.origins else ln.origin,
+                                               origins=ln.origins[s0:s1], **extra))
             start = b
     return out
 
