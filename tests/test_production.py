@@ -303,3 +303,40 @@ def test_documented_adoption_commands_end_to_end(tmp_path, files):
     assert (tmp_path / "attempts/attempt-1/code/run_full_corpus.py").exists()
     r = run("status", *common)
     assert r.returncode == 0 and sum(json.loads(r.stdout)["outputs"].values()) == len(files)
+
+
+R668 = "668c702ab87c23819bcca1ba81497be0ba6395a8"
+
+
+def test_pool_generations_replace_stdlib_recycling(serial_run, tmp_path, files, monkeypatch):
+    """Regression for the 668c702 live hang: stdlib max_tasks_per_child is never used; worker recycling
+    happens via many bounded pool generations in discovery and transform, byte-identical to serial."""
+    root_s, _ = serial_run
+    made = []
+    real = pr.ProcessPoolExecutor
+
+    def spy(*a, **kw):
+        assert "max_tasks_per_child" not in kw
+        made.append(kw["max_workers"])
+        return real(*a, **kw)
+
+    monkeypatch.setattr(pr, "ProcessPoolExecutor", spy)
+    head = make_workspace(tmp_path, files)
+    # 2 workers * 1 task per child -> 2-row generations; batch_files=2 forces discovery rotation.
+    c = cfg_for(tmp_path, head, len(files), workers=2, tasks_per_child=1, batch_files=2)
+    assert pr.generation_tasks(c, 2) == 2
+    assert pr.run(c)["phase"] == "packaged"
+    assert len(made) >= len(files)  # ~n/2 discovery + ~n/2 transform generations
+    assert tree_digest(tmp_path / "attempts/attempt-1/corpus") == tree_digest(root_s / "attempts/attempt-1/corpus")
+    assert ledger_rows(tmp_path) == ledger_rows(root_s)
+
+
+def test_migration_from_668c702(serial_run, tmp_path, files):
+    root_s, _ = serial_run
+    head, c = _old_runner_state(tmp_path, files)
+    (tmp_path / "ops/attempt-1/revision").write_text(R668 + "\n")
+    rec = pr.migrate(c, R668, head)
+    assert rec["migrated"] and rec["from"] == R668
+    assert (tmp_path / "ops/attempt-1/pre-migration-668c702/ledger.sqlite").exists()
+    assert pr.run(c)["phase"] == "packaged"
+    assert tree_digest(tmp_path / "attempts/attempt-1/corpus") == tree_digest(root_s / "attempts/attempt-1/corpus")

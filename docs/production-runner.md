@@ -224,3 +224,45 @@ This re-pins 27757e3. Then run `git -C $ROOT/repo checkout --detach $OLD` and re
 the same way. The on-disk formats are identical (same tables, pragmas and store format), and rows
 discovered by the new runner are reused as is. A full pre-upgrade copy is in
 `ops/attempt-1/pre-migration-27757e3/`.
+
+## Pool generations instead of stdlib worker recycling (upgrade from 668c702)
+
+**Why:** the live 668c702 run (WSL x86, Python 3.12) hung at 108,969/188,722 in discovery: parent in
+`futex_do_wait`, only the forkserver and resource tracker alive, zero pool workers, no CPU. `pool()` passed
+`max_tasks_per_child=200` to `ProcessPoolExecutor` (forkserver). CPython's in-executor worker recycling
+has known deadlocks where the executor stops replacing exited workers while futures stay pending
+(for example gh-115634). This matches the observed state.
+
+**Now:** `max_tasks_per_child` is never passed. The same bound (`Config.tasks_per_child`, default 200; no CLI flag) is
+applied with explicit **pool generations**: after `workers × tasks_per_child` tasks, the executor is shut
+down and replaced. Discovery rotates only at a batch boundary, after `map` has fully drained.
+Transform runs `_run_pool` once per generation over consecutive manifest slices, and the
+broken-pool/suspect isolation logic is unchanged. Task order, results, commits and outputs are identical
+(see `tests/test_production.py::test_pool_generations_replace_stdlib_recycling`: 2-row generations in
+both phases, byte-identical to serial; `test_migration_from_668c702`). `tasks_per_child=0` turns
+off rotation (Config only). There is no watchdog: the deadlock-prone code path is removed instead.
+
+### Rollout (live state pinned to 668c702, discovery phase, no outputs)
+
+The same rollout applies if the orchestrator is running a serial (`--workers 1`) 668c702 fallback.
+
+```sh
+ROOT=/mnt/machina-deid; PY=<python of the live env>
+NEW=<pushed commit of claude/machina-submission-readiness>
+OLD=668c702ab87c23819bcca1ba81497be0ba6395a8
+pgrep -af 'run_full_corpus|local-runner'; kill -INT <RUNNER_PID>     # NOT the downloader
+sleep 10; pgrep -af 'run_full_corpus|local-runner'
+# A hung parent may ignore SIGINT. kill -KILL is safe: group commit ensures a crash loses at most the
+# in-flight batch, which is re-discovered idempotently. Then kill leftover forkserver/resource_tracker
+# children of that runner (pgrep -af 'multiprocessing.(forkserver|resource_tracker)').
+git -C $ROOT/repo fetch origin claude/machina-submission-readiness
+git -C $ROOT/repo checkout --detach $NEW && test -z "$(git -C $ROOT/repo status --porcelain)"
+$PY $ROOT/repo/scripts/run_full_corpus.py migrate --root $ROOT --from-revision $OLD --expected-revision $NEW
+#   -> backs up to ops/attempt-1/pre-migration-668c702/, writes migration.json, re-pins $NEW
+nohup $PY $ROOT/repo/scripts/run_full_corpus.py run --root $ROOT --expected-revision $NEW \
+    --workers 8 --heavy-slots 2 >> $ROOT/ops/attempt-1/runner.log 2>&1 &
+grep 'Discovery checkpoint' $ROOT/ops/attempt-1/runner.log | tail -3
+```
+
+Rollback before any output works as for 27757e3: run `rollback-migration` (this re-pins 668c702), then
+check out `$OLD`. Use `--workers 1` on the old revision, because its parallel pool is the one affected.

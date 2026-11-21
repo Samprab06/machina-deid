@@ -55,6 +55,8 @@ MIGRATABLE_FROM = {
     "dc3da69225167cfe81bfbd5803ed02902efd0219",
     # 27757e3: identical on-disk state and discovery semantics; only per-row commits differ.
     "27757e305f9dbc8e4b607f991a6491734a7091ed",
+    # 668c702: identical state; its stdlib max_tasks_per_child pool could hang (pool generations fix).
+    "668c702ab87c23819bcca1ba81497be0ba6395a8",
 }
 RUNNER_PATTERNS = ("run_full_corpus", "local-runner")
 TEST_CRASH_ENV = "MACHINA_DEID_TEST_CRASH_SUFFIX"  # test-only: worker exits hard on this suffix
@@ -207,8 +209,16 @@ def is_heavy(cfg: Config, row: manifest.Row) -> bool:
 def pool(workers: int, cfg: Config, initializer=None, initargs=()) -> ProcessPoolExecutor:
     # forkserver: children never inherit the parent's open SQLite handles.
     ctx = multiprocessing.get_context("forkserver" if sys.platform.startswith("linux") else "spawn")
-    return ProcessPoolExecutor(max_workers=workers, mp_context=ctx, initializer=initializer, initargs=initargs,
-                               max_tasks_per_child=cfg.tasks_per_child)
+    # Never pass stdlib max_tasks_per_child: its in-pool worker recycling can deadlock the executor
+    # (CPython ProcessPoolExecutor recycling hangs, e.g. gh-115634; observed live on 3.12 at 668c702 as
+    # parent in futex wait with zero workers). Recycling is done instead by bounded pool generations
+    # (see generation_tasks): a fresh executor every workers * tasks_per_child tasks.
+    return ProcessPoolExecutor(max_workers=workers, mp_context=ctx, initializer=initializer, initargs=initargs)
+
+
+def generation_tasks(cfg: Config, workers: int) -> int:
+    """Tasks per pool generation (0 = unbounded). Bounds per-worker lifetime like tasks_per_child did."""
+    return workers * cfg.tasks_per_child if cfg.tasks_per_child > 0 else 0
 
 
 class RunLock:
@@ -354,6 +364,7 @@ def discover(cfg: Config, rows, ledger, catalog) -> None:
     log(f"Discovery resume: {len(done):,}/{total:,} recorded; workers={workers}")
     last_report = len(done)
     executor = pool(workers, cfg) if workers > 1 else None
+    gen_limit, gen_used = generation_tasks(cfg, workers), 0
     try:
         exit_seen = False
         while len(done) < total:
@@ -363,6 +374,11 @@ def discover(cfg: Config, rows, ledger, catalog) -> None:
                     ready.append((r, src))
             for batch in _batches(cfg, ready):
                 require_space(cfg)
+                if executor and gen_limit and gen_used >= gen_limit:
+                    # New pool generation at a batch boundary: nothing is in flight here.
+                    executor.shutdown(wait=True)
+                    executor, gen_used = pool(workers, cfg), 0
+                gen_used += len(batch)
                 args = [(str(src), r.path) for r, src in batch]
                 results = (executor.map(_discover_task, *zip(*args)) if executor
                            else (_discover_task(*a) for a in args))
@@ -630,11 +646,17 @@ def assemble(cfg: Config, rows, ledger) -> Counter:
     committer, errors = _Committer(cfg, ledger), Counter()
     try:
         queue = todo
+        gen = generation_tasks(cfg, cfg.workers)
         while queue:
-            ret = _run_pool(cfg, queue, committer, errors, cfg.workers)
+            # One _run_pool call == one pool generation of at most ``gen`` rows (bounded worker lifetime
+            # without stdlib max_tasks_per_child). Order and exactly-once accounting are unchanged.
+            chunk, tail = (queue[:gen], queue[gen:]) if gen else (queue, [])
+            ret = _run_pool(cfg, chunk, committer, errors, cfg.workers)
             if ret is None:
-                break
-            suspects, queue = ret
+                queue = tail
+                continue
+            suspects, rest = ret
+            queue = rest + tail
             log(f"Worker process died; retrying {len(suspects)} in-flight files one at a time")
             committer.flush()
             for row in suspects:  # isolate the culprit in a single-worker pool
@@ -775,7 +797,7 @@ def run(cfg: Config, *, script: Path | None = None, discovery_only: bool = False
 def migrate(cfg: Config, from_revision: str, to_revision: str) -> dict:
     """Adopt a dc3da69 or 27757e3 discovery-phase state for this revision; refuses once any output exists."""
     if from_revision not in MIGRATABLE_FROM:
-        raise RunnerError("only the documented dc3da69 or 27757e3 state can be migrated")
+        raise RunnerError("only the documented dc3da69, 27757e3 or 668c702 state can be migrated")
     if len(to_revision) != 40:
         raise RunnerError("target revision must be a full 40-character commit id")
     if other_runner_processes():
