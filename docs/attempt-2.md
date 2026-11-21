@@ -84,6 +84,88 @@ nohup $PY scripts/run_full_corpus.py run --root $ROOT --repo $REPO2 --attempt at
 Redacted aggregate checks to send back: `status` JSON, packaged summary (`transformed_with_residual`,
 `transformed_fully_clean`, outcomes), and `df -h` for E:.
 
+## Attempt 2b: the one-hit STEP effect, new formats, pilot
+
+**Why exactly one hit per file (41,956/41,956).** Every residual-positive transformed STEP row had
+`residual_approved == 1`. In 8a88c7d/c960298 a *transformed* STEP row can only get residual from
+(a) `mapped_present_in_unrequested_fields` (an approved FILE_NAME value repeated in a header field the
+transform does not edit: `preprocessor_version` or `time_stamp`), (b) DATA `unmodifiable` (counted for
+*every* undecodable ORGANIZATION/PERSON literal, approved or not), or (c) the attempt-1 typed-org gate (one
+per distinct value; fixed in c960298). Header `unmodifiable` makes the row *failed*, not residual. Exporters
+that write the organization/user into `preprocessor_version` produce exactly one hit per file, file after
+file; `tests/test_twopass.py` even pinned that behaviour. The synthetic benchmark reproduces it on
+c960298 (8/8 preprocessor-variant files, 1 hit each). The d13f849 pilot's surviving residual fits (a)/(b),
+not (c). This is an inference from code + counts; the pilot below measures it on real rows.
+
+**Fixes (approved values only; no catalog change; pass-2 only):**
+- `step_transform.PASS2_FIELDS` = default + `preprocessor` (header verifier unchanged). `time_stamp` is never
+  edited and still counted.
+- DATA `unmodifiable` counts an undecodable literal only if its raw utf-8/cp1252 form or best-effort
+  directive decoding contains a mapped value.
+- `step_data_transform.transform_descriptive`: boundary-aware substring replacement of *this file's own*
+  approved values in `PRODUCT` id/name/description, `PRODUCT_DEFINITION(_FORMATION[_WITH_SPECIFIED_SOURCE])`
+  id/description, `NEXT_ASSEMBLY_USAGE_OCCURRENCE` name/description, `ORGANIZATION.description`. Same
+  verifier (graph/arity/refs, numeric tokens, skeleton, unplanned literals) plus a post-check. Literals with
+  directives/8-bit bytes are left and counted. Geometry/representation labels are never edited and remain
+  in `independent_residual.step_data_literal_substring`. Also applied to ZIP STEP members.
+- **SVG** (`svg_meta`): whole-value text of `dc:creator|publisher|contributor|rights` (direct or
+  `cc:Agent/dc:title`) equal to a catalog value approved as `person`/`org`. Splice only; parser-vs-span
+  agreement, full element/attribute/tail comparison. DTD entities, non-UTF-8 and non-`svg` roots are refused.
+  `<title>`/`<desc>` free text is out of scope and is reported as `svg_raw_substring`.
+- **STL** (`stl_meta`): binary 80-byte header text, ASCII `solid`/`endsolid` names. Boundary-delimited
+  spans (1-4 tokens) equal to `person`/`org` approvals. Binary: body bytes `[80:]` and size identical.
+  ASCII: every non-solid line byte-identical, numeric tokens identical.
+- SVG/STL candidates are pass-2 only (`is_pass2_only`), so a rerun of discovery records nothing new.
+
+**Not implemented, on purpose:** SAT. ACIS headers hold product/version/date only, with no user or
+organization field. SolidWorks/Inventor OLE property sets: preserving every program-critical stream can't be
+proven without the vendor application, so these are unchanged passthrough. PDF lexical-boundary visible
+text: unchanged. FCStd `Document.xml` `CreatedBy`/`LastModifiedBy`/`Company` (4,717 files) is the
+most promising next format and is not done yet.
+
+**Compatibility:** outputs change only where a new stage fires. Every other output stays byte-identical
+to attempt 1 and is still hardlinked by `--reuse-from`. Incompatible cases are marked, not hidden: an
+attempt-1 SVG/STL row that was `unsupported_passthrough` can now become `transformed`,
+`no_approved_identities` or `failed` (status changes; bytes change only for `transformed`).
+
+**Synthetic benchmark** (`scripts/attempt2b_benchmark.py`, 24 STEP + 6 STL + 6 SVG, no real data):
+
+| | c960298 | attempt 2b |
+|---|---|---|
+| STEP approved occurrences left / before | 24 / 96 | 0 / 96 |
+| STEP reported-residual files (1 hit each) | 8 | 0 |
+| STEP fully clean | 8/24 | 24/24 |
+| STEP fields replaced | 72 | 96 |
+| STL+SVG transformed / left | 0 / 12 | 12 / 0 |
+| source preserved | 36/36 | 36/36 |
+
+`scripts/attempt2_benchmark.py` (the original 30-file set) is unchanged at 278 fields, 30/30 clean.
+
+### Pilot / diagnostic (read only, counts only)
+
+`scripts/attempt2_residual_pilot.py` opens the attempt-1 ledger with `mode=ro`, checks that the adopted
+catalog equals the frozen digest, and picks samples ordered by `sha256(path)`:
+residual-positive transformed rows per extension, a residual-free control set, and attempt-1
+SVG/STL passthrough rows. For each sample it checks the attempt-1 output against the ledger digest,
+hashes the input before and after, re-transforms into `--scratch` (refused inside
+`input/`, `attempts/` or `ops/`, deleted afterwards), and reports old vs new residual, status/reason codes,
+change counters, hardlinkability, and STEP input attribution by location type (`header:<field>`,
+`data:identity_*`, `data:descriptive_scoped_*`, `data:other_entity:<SCHEMA_TYPE>`). It never prints
+paths, values or pseudonyms.
+
+```bash
+cd $REPO2 && git pull --ff-only && NEW=$(git rev-parse HEAD) && uv run pytest -q
+$PY scripts/attempt2b_benchmark.py /tmp/a2b-bench-$$            # synthetic, no private data
+$PY scripts/attempt2_residual_pilot.py --root $ROOT --attempt attempt-2 --ref attempt-1 \
+    --scratch /tmp/a2b-pilot-$$ --per-ext 200 > /tmp/a2b-pilot.json   # send this JSON back
+# 2,000-output local pilot. If ops/attempt-2 is already pinned to c960298 the runner refuses the new
+# revision (by design, no mixed outputs): adopt a fresh attempt name from attempt 1 instead.
+$PY scripts/run_full_corpus.py adopt --root $ROOT --repo $REPO2 --attempt attempt-2b --from-attempt attempt-1
+$PY scripts/run_full_corpus.py run --root $ROOT --repo $REPO2 --attempt attempt-2b --reuse-from attempt-1 \
+    --expected-revision $NEW --workers 10 --stop-after-outputs 2000 --no-package
+$PY scripts/run_full_corpus.py status --root $ROOT --attempt attempt-2b
+```
+
 ## Runtime / memory assumptions
 
 Linked rows cost one streamed read of input + one of the attempt-1 output (no write). Transform rows are
