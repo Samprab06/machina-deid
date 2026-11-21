@@ -89,6 +89,46 @@ def test_interrupt_and_resume(tmp_path):
     db2.close()
 
 
+def test_recover_transformed_checkpoint_validates_existing_output(tmp_path):
+    path = tmp_path / "s.sqlite"
+    db = StateDB(path)
+    src = reg(db, tmp_path, "f.pdf")
+    (rec,) = db.select_batch(1)
+    output = tmp_path / "out" / "f.pdf"
+    output.parent.mkdir()
+    output.write_bytes(b"validated output")
+    import hashlib
+    db.mark_transformed(rec["id"], output, hashlib.sha256(output.read_bytes()).hexdigest(),
+                        validation_status="ok", outcome="transformed_validated")
+    db.close()
+
+    db = StateDB(path)
+    assert db.recover_checkpoints() == 1
+    row = db.get(rec["id"])
+    assert row["status"] == "validated"
+    assert row["output_sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
+    db.close()
+
+
+def test_recover_transformed_checkpoint_fails_if_output_changed(tmp_path):
+    path = tmp_path / "s.sqlite"
+    db = StateDB(path)
+    reg(db, tmp_path, "f.pdf")
+    (rec,) = db.select_batch(1)
+    output = tmp_path / "out" / "f.pdf"
+    output.parent.mkdir()
+    output.write_bytes(b"original")
+    db.mark_transformed(rec["id"], output, "not-the-output-hash", outcome="transformed_validated")
+    output.write_bytes(b"changed")
+    db.close()
+
+    db = StateDB(path)
+    assert db.recover_checkpoints() == 1
+    row = db.get(rec["id"])
+    assert row["status"] == "failed" and row["outcome"] == "failed_validation"
+    db.close()
+
+
 def test_sources_never_deleted(db, tmp_path):
     src = reg(db, tmp_path, "a.pdf")
     (r,) = db.select_batch(1)

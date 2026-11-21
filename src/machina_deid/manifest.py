@@ -85,7 +85,10 @@ def parse_manifest(path: str | Path) -> tuple[list[Row], int]:
 
 
 def _fmt(row: Row, include_paths: bool) -> dict:
-    d = {"path_id": row.path_id, "ext": row.ext, "top_dir": row.top_dir, "bytes": row.size}
+    top_dir = row.top_dir if include_paths else (
+        hashlib.sha256(row.top_dir.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+        if row.top_dir else "")
+    d = {"path_id": row.path_id, "ext": row.ext, "top_dir": top_dir, "bytes": row.size}
     if include_paths:
         d["path"] = row.path
     return d
@@ -212,6 +215,18 @@ def analyze(rows: list[Row], malformed: int = 0, *, top_n: int = 20, long_path: 
     prio.sort(key=lambda p: (p["tier"], -p["bytes"]))
 
     mounts = measure_mounts(reserves or {})
+    projection = project_usage(rows, mounts, batch_bytes, output_ratio, archive_expansion)
+    if not include_paths:
+        mounts = [
+            {**{k: v for k, v in mount.items() if k != "path"},
+             "mount_id": hashlib.sha256(mount["path"].encode("utf-8", "surrogateescape")).hexdigest()[:12]}
+            for mount in mounts
+        ]
+        projection = {**projection, "mounts": [
+            {**{k: v for k, v in mount.items() if k != "path"},
+             "mount_id": hashlib.sha256(mount["path"].encode("utf-8", "surrogateescape")).hexdigest()[:12]}
+            for mount in projection["mounts"]
+        ]}
     return {
         "summary": {"files": len(rows), "bytes": total, "malformed_lines": malformed,
                     "empty_files": sum(1 for r in rows if r.size == 0)},
@@ -221,8 +236,7 @@ def analyze(rows: list[Row], malformed: int = 0, *, top_n: int = 20, long_path: 
         "duplicates": duplicates,
         "long_paths": long_paths,
         "prioritization": prio,
-        "storage": {"mounts": mounts,
-                    "projection": project_usage(rows, mounts, batch_bytes, output_ratio, archive_expansion)},
+        "storage": {"mounts": mounts, "projection": projection},
         "paths_included": include_paths,
     }
 
@@ -262,16 +276,17 @@ def to_markdown(rep: dict) -> str:
     st = rep["storage"]
     pr = st["projection"]
     L += ["", "## Storage (measured free space minus reserve)", "",
-          "| path | free | reserve | usable |", "|---|---:|---:|---:|"]
-    L += [f"| {m['path']} | {_gib(m['free'])} | {_gib(m['reserve'])} | {_gib(m['usable'])} |" for m in st["mounts"]]
+          "| mount | free | reserve | usable |", "|---|---:|---:|---:|"]
+    L += [f"| {m.get('path', m.get('mount_id'))} | {_gib(m['free'])} | {_gib(m['reserve'])} | {_gib(m['usable'])} |"
+          for m in st["mounts"]]
     A = pr["assumptions"]
     L += ["", f"Projection: batch {_gib(pr['batch_bytes'])}, multiplier {A['per_byte_multiplier']} "
           f"(output ratio {A['output_ratio']}, archive share {A['archive_share']}, archive expansion"
           f" {A['archive_expansion']}) => {_gib(pr['batch_projected_usage'])} per batch; corpus"
           f" {_gib(pr['corpus_bytes'])} in {pr['batches_for_corpus']} batches; files larger than batch:"
           f" {pr['files_larger_than_batch']}", "",
-          "| path | batch fits | max safe batch | corpus output fits |", "|---|---|---:|---|"]
-    L += [f"| {m['path']} | {m['batch_fits']} | {_gib(m['max_safe_batch_bytes'])} | {m['output_fits_corpus']} |"
+          "| mount | batch fits | max safe batch | corpus output fits |", "|---|---|---:|---|"]
+    L += [f"| {m.get('path', m.get('mount_id'))} | {m['batch_fits']} | {_gib(m['max_safe_batch_bytes'])} | {m['output_fits_corpus']} |"
           for m in pr["mounts"]]
     return "\n".join(L) + "\n"
 

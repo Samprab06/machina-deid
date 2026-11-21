@@ -12,7 +12,8 @@ Safety properties
   ``step_transform``); DATA is byte-identical. No header match -> passed through with
   outcome ``inspected_no_identifiers``; unreplaceable match -> nothing materialized.
 - Every record carries an explicit ``outcome``: transformed_validated, inspected_no_identifiers,
-  unsupported_passthrough, identifiers_unmodifiable or failed_validation.
+  unsupported_passthrough, identifiers_unmodifiable or failed_validation. Missing and mismatched
+  sources are terminal failed-validation accounting rows, not silently dropped rows.
   Pass-through is never reported as de-identified.
 - PDF/DXF are transformed only when an explicit identity map for that format is given;
   otherwise they are passed through unchanged with a ``no_identity_map`` limitation.
@@ -152,7 +153,7 @@ def _build_archive(src: Path, sha: str, cas: Path, maps, tmp_dir: Path):
             raise _Fail("archive_rebuild_verification_failed")
         note = _archive_note(res, mapped)
         if not mapped:
-            outcome = "inspected_no_map"
+            outcome = "unsupported_passthrough"
         elif res.complete:
             outcome = ("transformed_validated" if res.counts.get("transformed_validated")
                        else "inspected_no_identifiers")
@@ -189,7 +190,13 @@ def _atomic_copy(src: Path, dst: Path) -> None:
             shutil.copyfileobj(i, o, 1 << 20)
             o.flush()
             os.fsync(o.fileno())
-        os.rename(tmp, dst)  # tmp is our own file
+            os.rename(tmp, dst)  # tmp is our own file
+        # Make the rename itself durable before the database checkpoint commits.
+        dir_fd = os.open(dst.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     finally:
         if tmp.exists():
             tmp.unlink()
@@ -370,6 +377,7 @@ def process(manifest: str | Path, source_root: str | Path, output_root: str | Pa
     stats: Counter = Counter()
     try:
         stats["recovered_interrupted"] = db.recover_interrupted()
+        stats["recovered_transformed"] = db.recover_checkpoints()
         if retry_failed:
             stats["requeued"] = db.requeue_failed()
         summary_ingest = ingest(db, rows[:limit], root)

@@ -75,6 +75,7 @@ def test_passthrough_aliases_and_hashes(env):
     assert pdf["outcome"] == "identifiers_unmodifiable"
     assert (out / "a/doc.pdf").read_bytes() == (env["src"] / "a/doc.pdf").read_bytes()
     assert rows["a/fake.pdf"]["status"] == "skipped" and rows["a/fake.pdf"]["error_category"] == "classification_mismatch"
+    assert rows["a/fake.pdf"]["outcome"] == rows["a/missing.bin"]["outcome"] == "failed_validation"
     assert rows["a/missing.bin"]["status"] == "skipped"
     assert not (out / "a/fake.pdf").exists() and not (out / "a/missing.bin").exists()
     db.close()
@@ -271,11 +272,11 @@ def test_archive_no_map_inspected_not_deidentified(tmp_path):
     from step_helpers import step_bytes
     args, src_bytes = _zip_env(tmp_path, {'d/part.step': step_bytes(), 'readme.txt': b'hi'})
     res = pr.process(*args, limit=2, min_free=0)
-    assert res['this_run']['outcome_inspected_no_map'] == 2
+    assert res['this_run']['outcome_unsupported_passthrough'] == 2
     assert res['this_run']['cas_reused'] == 1
     recs = _records(args[3])
     for r in recs:
-        assert r['status'] == 'validated' and r['outcome'] == 'inspected_no_map'
+        assert r['status'] == 'validated' and r['outcome'] == 'unsupported_passthrough'
         assert r['disposition'] == 'archive_rebuilt' and r['validation_status'] == 'archive_rebuilt_verified'
         assert 'archive_complete=0' in r['note'] and 'inspected_no_map=1' in r['note']
         assert r['input_sha256'] == sha(src_bytes)

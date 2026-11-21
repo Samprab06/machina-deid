@@ -8,6 +8,7 @@ rejects traversal.
 """
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -231,7 +232,8 @@ class StateDB:
                          outcome=outcome)
 
     def mark_skipped(self, rid: int, reason: str) -> None:
-        self._transition(rid, SKIPPED, error_category=reason)
+        # Skips are terminal accounting outcomes, not silently unfinished rows.
+        self._transition(rid, SKIPPED, error_category=reason, outcome="failed_validation")
 
     def requeue_failed(self) -> int:
         """Return failed/skipped records to pending (explicit retry). Validated records are never touched."""
@@ -251,3 +253,35 @@ class StateDB:
             cur = c.execute("UPDATE records SET status=?, error_category='interrupted', updated_at=? WHERE status=?",
                             (PENDING, _now(), IN_PROGRESS))
             return cur.rowcount
+
+    def recover_checkpoints(self) -> int:
+        """Finish or fail durable ``transformed`` checkpoints after a crash.
+
+        The output path and checksum are committed before the validation status
+        transition.  On restart, validate that exact output rather than
+        rebuilding it; a changed or missing output becomes an explicit failure.
+        """
+        rows = self.conn.execute(
+            "SELECT id, output_path, output_sha256, validation_status FROM records WHERE status=?",
+            (TRANSFORMED,),
+        ).fetchall()
+        recovered = 0
+        for row in rows:
+            output = Path(row["output_path"]) if row["output_path"] else None
+            valid = bool(output and output.is_file() and not output.is_symlink() and row["output_sha256"])
+            if valid:
+                digest = hashlib.sha256()
+                try:
+                    with output.open("rb") as handle:
+                        while chunk := handle.read(1 << 20):
+                            digest.update(chunk)
+                    valid = digest.hexdigest() == row["output_sha256"]
+                except OSError:
+                    valid = False
+            if valid:
+                self.mark_validated(row["id"], row["validation_status"] or "recovered_output_hash")
+            else:
+                self.mark_failed(row["id"], "output_checkpoint_missing_or_changed",
+                                 validation_status="failed", outcome="failed_validation")
+            recovered += 1
+        return recovered

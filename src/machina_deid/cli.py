@@ -70,7 +70,10 @@ def cmd_state(a) -> int:
         elif a.action == "status":
             print(json.dumps(db.counts(), indent=2))
         elif a.action == "recover":
-            print(f"returned {db.recover_interrupted()} interrupted records to pending")
+            interrupted = db.recover_interrupted()
+            transformed = db.recover_checkpoints()
+            print(f"returned {interrupted} interrupted records to pending; "
+                  f"reconciled {transformed} transformed checkpoints")
         elif a.action == "select":
             batch = db.select_batch(a.max_files, mf.parse_size(a.max_bytes) if a.max_bytes else None, a.transformer)
             for r in batch:

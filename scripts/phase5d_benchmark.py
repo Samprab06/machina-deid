@@ -30,6 +30,7 @@ import re
 import resource
 import secrets
 import sys
+import tempfile
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -106,10 +107,23 @@ def _private_dir(p: Path) -> Path:
 
 
 def _write_private(p: Path, text: str) -> None:
-    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.chmod(p, 0o600)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{p.name}.", dir=p.parent)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, p)
+        dir_fd = os.open(p.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def peak_rss_mib() -> float:
@@ -393,7 +407,6 @@ def run(bench: Path, *, transform: bool, run_name: str | None = None) -> dict:
         "approval_policy": "unchanged twopass.auto_decision",
         "elapsed_s_total": round(time.monotonic() - t0, 3),
         "peak_rss_mib": peak_rss_mib(),
-        "run_dir": str(run_dir),
     }
     _write_private(run_dir / "public-report.json", json.dumps(report, indent=2, sort_keys=True))
     return report
