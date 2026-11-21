@@ -330,6 +330,24 @@ def _transform_step(src: Path, dst: Path, idmap: IdentityMap, org_map: dict[str,
         return True
 
 
+def _independent_pdf_check(src: Path, dst: Path, values: list[str], out) -> bool:
+    """Rescan the written PDF with the independent inspector; on any residual approved value, missing
+    coverage, or page geometry change, remove the output and fail. Records redacted counts only."""
+    from .pdf_residual import inspect_pdf
+    rep = inspect_pdf(dst, values)
+    before = inspect_pdf(src, [])
+    out.independent_residual = {k: v for k, v in rep.residual.items() if v}
+    out.residual_approved += rep.total
+    reason = ("independent_inspection_incomplete" if not rep.ok or not before.ok
+              else "independent_geometry_mismatch" if (rep.pages, rep.dimensions) != (before.pages, before.dimensions)
+              else "independent_residual" if rep.total else "")
+    if reason:
+        out.reason = reason
+        dst.unlink(missing_ok=True)  # our own output only; never claimed clean
+        return False
+    return True
+
+
 @dataclass
 class TransformOutcome:
     path: str
@@ -342,6 +360,8 @@ class TransformOutcome:
     data_organizations_replaced: int = 0
     source_unchanged: bool = True
     output_written: bool = False
+    independent_residual: dict[str, int] = field(default_factory=dict)  # category -> count (PDF rescan)
+    fully_clean: bool = False  # transformed AND no residual approved value detected anywhere
 
     def to_dict(self) -> dict:
         return dict(self.__dict__)
@@ -380,6 +400,8 @@ def transform_file(cat: IdentityCatalog, src: str | Path, dst: str | Path, rel_p
             from .pdf_transform import transform_pdf
             r = transform_pdf(src, dst, idmap, overwrite=overwrite)
             ok, out.fields_replaced, out.residual_approved = r.ok, _sum(r.matches), _sum(r.residual)
+            if ok:
+                ok = _independent_pdf_check(src, dst, list(idmap.strings), out)
         elif fmt == "dxf":
             from .dxf_transform import transform_dxf
             r = transform_dxf(src, dst, idmap, overwrite=overwrite)
@@ -403,4 +425,6 @@ def transform_file(cat: IdentityCatalog, src: str | Path, dst: str | Path, rel_p
     if not ok and not out.reason:
         out.reason = "transformer_validation_failed"
     out.source_unchanged = _sha_file(src) == before
+    out.fully_clean = (ok and out.output_written and out.residual_approved == 0
+                       and not any(out.independent_residual.values()))
     return out

@@ -219,8 +219,15 @@ def _transform_member(kind: str, data: bytes, idmap: IdentityMap, work: Path, re
             r = transform_pdf(src, dst, idmap)
             rep.replacements = dict(r.matches)
             if r.ok and r.matches:
-                rep.outcome = "transformed_validated"
-                return dst.read_bytes()
+                from .pdf_residual import inspect_pdf
+                ind, base = inspect_pdf(dst, list(idmap.strings)), inspect_pdf(src, [])
+                if (ind.ok and base.ok and not ind.total
+                        and (ind.pages, ind.dimensions) == (base.pages, base.dimensions)):
+                    rep.outcome = "transformed_validated"
+                    return dst.read_bytes()
+                rep.outcome, rep.reason = "identifiers_unmodifiable", "pdf_independent_residual"
+                rep.residual = dict(ind.residual_by_index) or _scan(data, idmap)
+                return data
             if r.ok:
                 rep.outcome = "inspected_no_identifiers"
                 rep.residual = _scan(data, idmap)  # e.g. metadata-only hits are kept and reported

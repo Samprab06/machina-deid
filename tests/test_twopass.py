@@ -347,3 +347,22 @@ def test_cli_roundtrip(tmp_path, corpus, monkeypatch, capsys):
     for raw in RAW:
         assert raw not in out
     assert_no_raw(tmp_path / "cat")
+
+
+def test_step_org_also_in_preprocessor_transformed_but_residual_reported(tmp_path, cat):
+    src = tmp_path / "p.step"
+    src.write_bytes(step_bytes(name="bracket", author="('')", org=f"('{ORG}')", preproc=f"{ORG} exporter"))
+    before = src.read_bytes()
+    tp.discover_batch(cat, [(src, src.name)], limit=1)
+    assert cat.approved_pseudonym(ORG, kind="org") is not None  # approved from FILE_NAME.organization
+    dst = tmp_path / "out" / "p.step"
+    o = tp.transform_file(cat, src, dst, src.name)
+    assert o.status == "transformed" and o.output_written and o.source_unchanged
+    assert o.fields_replaced >= 1 and o.residual_approved >= 1
+    assert o.fully_clean is False
+    head = dst.read_bytes().split(b"DATA;")[0].decode("latin-1")
+    org_field = head.split("/* organization */")[1].split("/* preprocessor_version */")[0]
+    pre_field = head.split("/* preprocessor_version */")[1].split("/* originating_system */")[0]
+    assert ORG not in org_field and cat.approved_pseudonym(ORG)[1] in org_field
+    assert ORG in pre_field  # unsupported field left untouched, surfaced as residual
+    assert src.read_bytes() == before
