@@ -52,3 +52,27 @@ python -m machina_deid.ole_cli transform IN OUT --map map.json | --alias-key-fil
 - DocumentSummaryInformation and user-defined properties are not parsed.
 - Inventor is detected but has no target, because LASTAUTHOR is absent.
 - Tests use only flat synthetic CFB v3 files (512-byte sectors). The parser supports 4096-byte sectors and nested storages, but no fixture covers them yet.
+
+## Follow-up to 42a508e (compatible additions; read before integrating)
+API kept: `parse`, `scan`, `transform(data, mapping, pids=...)`, `inspect_result`, `Result` (`.data/.writes/.counts/.reason`),
+and CLI `inspect` / `transform --map | --alias-key-file`. Additions and behaviour changes:
+
+- **Width-preserving aliases.** `equal_length_alias` now replaces each character with one of identical UTF-8 width,
+  UTF-16 unit count and byte width in every `LEGACY_CODECS` page. Separators (`\ / @ . : - _`) and whitespace are kept.
+  New helpers: `widths_match`, `char_signature`, `LEGACY_CODECS`. `transform` also refuses mappings whose UTF-16
+  length differs (`alias_length_mismatch`).
+  **Note:** the derivation changed, so `--alias-key-file` aliases differ from 42a508e for the same key. Integration that
+  supplies catalog pseudonyms via `mapping` is unaffected; do not mix derived aliases across the two commits.
+- **`AliasRegistry(key, fixed)`** detects alias collisions within a process or shared config (`alias_collision`).
+  No global uniqueness is claimed. CLI: `transform IN OUT --alias-config CFG.json` with
+  `{"key_file": PATH, "fixed": {original: alias}}` (a relative `key_file` resolves against the config's directory).
+- **MFC CString length counts UTF-16 code units** (was code points), so astral-plane accounts now match.
+- **Short accounts (< 3 UTF-16 units)** are no longer rewritten as bare path/contact tokens. They are still written via
+  the exact typed property and exact-length CStrings; remaining hits are counted as `raw_utf16`. Expect fewer
+  `path_component` writes for 1–2 character accounts.
+- **CLI output safety:** the source is opened read-only (`O_NOFOLLOW`); OUT must not exist and must not be the source;
+  it is written via same-directory temp file + fsync + `link` (no overwrite) + directory fsync. New refusals:
+  `output_exists`, `output_is_source`.
+
+Tests: `tests/test_ole_transform.py` (35, synthetic only). Fixture `cstring()` now writes UTF-16 unit lengths;
+`expected()` builds the never-written PreviewPNG/Ansi streams independently of property vt/code page.
