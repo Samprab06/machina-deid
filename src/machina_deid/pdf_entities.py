@@ -84,7 +84,7 @@ class _Obs:
     families: set = field(default_factory=set)
     labeled: int = 0
     display: str = ""
-    ole: str = ""  # exact value of a parsed OLE saved-account property (structured; does not vote a kind)
+    ole: set[str] = field(default_factory=set)  # exact values of parsed OLE saved-account properties
 
 
 class EntityMapBuilder:
@@ -113,7 +113,7 @@ class EntityMapBuilder:
             o.families.add(fam)
             o.labeled += f.source.startswith(("label", "structured")) or f.source == "inline"
             if f.source.startswith("structured:ole"):
-                o.ole = o.ole or f.value
+                o.ole.add(f.value)
                 continue
             o.kinds[f.kind] += 1
             o.display = o.display or f.value
@@ -126,7 +126,7 @@ class EntityMapBuilder:
         for n, o in self._obs.items():
             if not o.kinds:  # seen only as an OLE saved account
                 o.kinds["account"] += 1
-                o.display = o.ole
+                o.display = min(o.ole)
             (kind, top), *rest = o.kinds.most_common() + [("", 0)]
             second = rest[0][1] if rest else 0
             amb = kind not in _PATTERN_KINDS and second > 0 and top < 4 * second
@@ -170,33 +170,63 @@ class EntityMapBuilder:
             raise EntityMapError("entity map exists; frozen maps are never overwritten")
         decided, stats = self._decide()
         mapper = PseudonymMapper(self._secret)
-        rows = []
-        used: dict[str, str] = {}
-        for n, d in sorted(decided.items()):
-            kind, r = d["kind"], d["root"]
-            ps = None
+        from .ole_transform import OleError, equal_length_alias, widths_match
+
+        members: dict[str, list[str]] = defaultdict(list)
+        for value, decision in sorted(decided.items()):
+            members[decision["root"]].append(value)
+
+        # Canonical and fitted tokens are both visible in outputs. Reserve each
+        # token across every root before allowing a row to resolve.
+        aliases = {}
+        token_roots: dict[str, set[str]] = defaultdict(set)
+        conflicted = set()
+        for root, group in sorted(members.items()):
+            kind = decided[root]["kind"]
+            approved = set()
             if self._catalog is not None:
-                hit = self._catalog.approved_pseudonym(n)
-                rhit = self._catalog.approved_pseudonym(r) if r != n else hit
-                hit = rhit or hit
-                if hit is not None:
-                    ps = hit[1]
-                    stats["catalog_pseudonym"] += 1
-            o = d["obs"]
-            if ps is None and o.ole and self._ole_key is not None and r == n:
-                # Also saved in an OLE account field: one equal-length pseudonym shared by OLE and PDF.
-                from .ole_transform import equal_length_alias
-                ps = equal_length_alias(o.ole, self._ole_key)
-                stats["ole_equal_length_pseudonym"] += 1
-            if ps is None:
-                ps = mapper.pseudonym(kind if kind in FIT_CODES else "text", r)
-            if used.setdefault(ps, r) != r and d["status"] == "ok":
-                # two different roots must never share a pseudonym (catalog alias roots excepted)
+                for value in group:
+                    hit = self._catalog.approved_pseudonym(value)
+                    if hit is not None:
+                        approved.add(hit[1])
+            if len(approved) > 1:
+                conflicted.add(root)
+                stats["alias_conflicting_catalog_values"] += 1
+            pseudonym = min(approved) if approved else None
+            if pseudonym is not None:
+                stats["catalog_pseudonym"] += 1
+
+            accounts = sorted({account for value in group for account in decided[value]["obs"].ole})
+            if pseudonym is None and accounts and self._ole_key is not None:
+                try:
+                    candidate = equal_length_alias(accounts[0], self._ole_key)
+                    if all(candidate != value and widths_match(value, candidate) for value in accounts):
+                        pseudonym = candidate
+                        stats["ole_equal_length_pseudonym"] += 1
+                except OleError:
+                    stats["ole_no_width_alias"] += 1
+            if pseudonym is None:
+                pseudonym = mapper.pseudonym(kind if kind in FIT_CODES else "text", root)
+            fitting = pseudonym if accounts and all(widths_match(value, pseudonym) for value in accounts) else fitted(pseudonym, kind)
+            aliases[root] = (kind, pseudonym, fitting)
+            if decided[root]["status"] == "ok":
+                for token in (pseudonym, fitting):
+                    token_roots[_normalize(token)].add(root)
+
+        for roots in token_roots.values():
+            if len(roots) > 1:
+                conflicted.update(roots)
                 stats["pseudonym_shared_across_roots"] += 1
-            lookup_ok = int(d["status"] == "ok" and _lookup_eligible(kind, o))
-            fit = ps if o.ole and len(ps) == len(o.ole) else fitted(ps, kind)
-            rows.append((_vkey(self._secret, n), kind, ps, fit, d["status"], len(o.docs),
-                         int(o.labeled), lookup_ok, _vkey(self._secret, r)))
+
+        rows = []
+        for value, decision in sorted(decided.items()):
+            root = decision["root"]
+            kind, pseudonym, fitting = aliases[root]
+            status = "ambiguous" if root in conflicted else decision["status"]
+            observation = decision["obs"]
+            lookup_ok = int(status == "ok" and _lookup_eligible(kind, observation))
+            rows.append((_vkey(self._secret, value), kind, pseudonym, fitting, status, len(observation.docs),
+                         int(observation.labeled), lookup_ok, _vkey(self._secret, root)))
         tmp = path.with_name(path.name + ".tmp")
         tmp.unlink(missing_ok=True)
         db = sqlite3.connect(tmp)

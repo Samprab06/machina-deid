@@ -71,13 +71,19 @@ def _decode_bytes(b: bytes) -> str:
 
 
 class _Matcher:
-    def __init__(self, values: list[str]):
+    def __init__(self, values: list[str], *, word_boundaries: bool = False):
         self.values = [(i, v.casefold(), _WS.sub("", v.casefold())) for i, v in enumerate(values) if v.strip()]
+        self.patterns = [
+            (i, re.compile(r"(?<!\w)" + r"\s+".join(map(re.escape, v.split())) + r"(?!\w)"))
+            for i, v, _ in self.values
+        ] if word_boundaries else []
 
     def count(self, text: str, *, compact: bool = False) -> dict[int, int]:
         if not text:
             return {}
         low = text.casefold()
+        if self.patterns:
+            return {i: n for i, pattern in self.patterns if (n := sum(1 for _ in pattern.finditer(low)))}
         flat = _WS.sub("", low) if compact else ""
         out = {}
         for i, v, vc in self.values:
@@ -124,10 +130,10 @@ def _visible_text(page) -> str:
     return "\n".join(lines)
 
 
-def inspect_pdf(path: str | Path, values: list[str]) -> PdfResidualReport:
+def inspect_pdf(path: str | Path, values: list[str], *, word_boundaries: bool = False) -> PdfResidualReport:
     """Read-only rescan of ``path`` for each of ``values`` (exact, case-insensitive)."""
     rep = PdfResidualReport(values_checked=len(values))
-    m = _Matcher(values)
+    m = _Matcher(values, word_boundaries=word_boundaries)
 
     def add(cat: str, hits: dict[int, int]):
         for i, n in hits.items():

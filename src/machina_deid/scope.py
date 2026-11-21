@@ -61,7 +61,7 @@ def is_cfb_path(path: str | Path) -> bool:
 def scan_pdf(source, ocr: bool = False) -> tuple[str, list[Obs]]:
     """``source``: path or bytes. Returns (status, observations). Status: ok | encrypted | failed:<type>."""
     import pymupdf
-    from .pdf_titleblock import page_lines, scan_page_lines
+    from .pdf_titleblock import page_lines, scan_page_lines, valid_value
     try:
         doc = pymupdf.open(stream=source, filetype="pdf") if isinstance(source, bytes) else pymupdf.open(source)
     except Exception as exc:  # noqa: BLE001 - type name only
@@ -69,7 +69,10 @@ def scan_pdf(source, ocr: bool = False) -> tuple[str, list[Obs]]:
     try:
         if doc.needs_pass:
             return "encrypted", []
+        author = ((doc.metadata or {}).get("author") or "").strip()
         out: list[Obs] = []
+        if valid_value("person", author):
+            out.append(Obs("person", author, "structured:pdf_author"))
         for page in doc:
             lines = page_lines(page)
             if not lines and ocr:
@@ -199,7 +202,6 @@ class Scope:
         if not expect_digest:
             raise ValueError("the frozen entity-map digest is required")
         self.map_path, self._secret, self.digest = Path(map_path), bytes(secret), expect_digest
-        self._alias_key = ole_alias_key(self._secret)
         self.ocr = ocr
         Resolver(self._secret, self.map_path, expect_digest=expect_digest).close()  # fail fast
 
@@ -227,11 +229,6 @@ class Scope:
             dst.unlink(missing_ok=True)
 
     # -------------------------------------------------------------- OLE
-    def ole_alias(self, value: str, pseudonym: str) -> str:
-        if pseudonym != value and ot.widths_match(value, pseudonym):
-            return pseudonym
-        return ot.equal_length_alias(value, self._alias_key)
-
     def ole(self, data: bytes) -> OleOutcome:
         try:
             props = ot.summary_props(ot.parse(data), OLE_PIDS)
@@ -251,8 +248,10 @@ class Scope:
                     out.unresolved["not_in_frozen_map"] += 1
                 elif e.status != "ok":
                     out.unresolved["ambiguous_identity"] += 1
+                elif e.pseudonym == v or not ot.widths_match(v, e.pseudonym):
+                    out.unresolved["frozen_alias_width_mismatch"] += 1
                 else:
-                    mapping[v] = self.ole_alias(v, e.pseudonym)
+                    mapping[v] = e.pseudonym
         finally:
             r.close()
         out.mapped = len(mapping)

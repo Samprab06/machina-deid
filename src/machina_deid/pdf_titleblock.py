@@ -10,6 +10,7 @@ Findings carry the raw value in memory only (``repr`` is redacted). Nothing here
 """
 from __future__ import annotations
 
+import dataclasses
 import math
 import re
 from dataclasses import dataclass, field
@@ -22,17 +23,17 @@ from .discovery import _plausible, normalize
 
 # role -> (kind, label regex). Order matters only for documentation; matching is whole-label.
 ROLE_LABELS: dict[str, tuple[str, str]] = {
-    "drawn": ("person", r"drawn(?:\s*by)?|drn|dwn|drafted(?:\s*by)?|draftsman|drawer"),
-    "designed": ("person", r"design(?:ed)?(?:\s*by)?|dsgn|dsn|designer"),
-    "checked": ("person", r"check(?:ed)?(?:\s*by)?|chk|chkd|ckd|checker"),
-    "approved": ("person", r"approv(?:ed|al)?(?:\s*by)?|appd|appr|apvd|app'd"),
+    "drawn": ("person", r"drawn(?:\s*by)?|drn|dwn|drafted(?:\s*by)?|draftsman|drawer|gezeichnet(?:\s+von)?|dessin[ée](?:\s+par)?|dessinateur"),
+    "designed": ("person", r"design(?:ed)?(?:\s*by)?|dsgn|dsn|designer|konstruiert(?:\s+von)?|bearbeitet(?:\s+von)?|con[çc]u(?:\s+par)?"),
+    "checked": ("person", r"check(?:ed)?(?:\s*by)?|chk|chkd|ckd|checker|gepr[üu]ft(?:\s+von)?|v[ée]rifi[ée](?:\s+par)?"),
+    "approved": ("person", r"approv(?:ed|al)?(?:\s*by)?|appd|appr|apvd|app'd|freigabe|freigegeben(?:\s+von)?|approuv[ée](?:\s+par)?"),
     "engineer": ("person", r"engineer|eng(?:ineering)?\s*appr(?:oval)?|resp(?:onsible)?\.?\s*eng(?:ineer)?"),
     "reviewed": ("person", r"review(?:ed)?(?:\s*by)?|verified(?:\s*by)?"),
     "issued": ("person", r"issued\s*by|released\s*by|prepared\s*by|created\s*by|modified\s*by|revised\s*by"),
     "author": ("person", r"author|originator|owner\s*name|contact\s*name|contact|attn|attention"),
     "qa": ("person", r"q\.?a\.?(?:\s*appr(?:oval)?)?|quality|mfg\s*appr(?:oval)?|manufacturing\s*appr(?:oval)?"),
     "company": ("org", r"company(?:\s*name)?|customer|client|supplier|vendor|manufacturer|owner|organi[sz]ation|"
-                       r"firm|contractor|consultant|prepared\s*for|bill\s*to|ship\s*to|sold\s*to"),
+                       r"firm|contractor|consultant|prepared\s*for|bill\s*to|ship\s*to|sold\s*to|firma|kunde|entreprise|soci[ée]t[ée]"),
     "project": ("project", r"project(?:\s*name)?|job(?:\s*name)?|site"),
     "email": ("email", r"e-?mail|mail"),
     "phone": ("phone", r"tel(?:ephone)?|phone|ph|fax|mobile|cell"),
@@ -61,7 +62,7 @@ URL_RE = re.compile(r"(?<![\w@.-])(?:https?://)?(?:www\.)(?:[A-Za-z0-9-]{1,63}\.
 _URL_DOMAIN = re.compile(r"(?:https?://)?(?:www\.)?((?:[A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,24})", re.I)
 # Phone: needs separators or a leading +, 7..15 digits overall, not a date/dimension/tolerance.
 PHONE_RE = re.compile(r"(?<![\w.+/-])(?:\+\d{1,3}[\s.-]?)?(?:\(\d{1,5}\)[\s.-]?)?\d{2,6}(?:[\s.-]\d{2,6}){1,4}(?![\w./-])")
-_NAME_TOKEN = re.compile(r"^(?:[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ'’\-]*\.?|[A-Za-z]\.(?:[A-Za-z]\.)*[A-Za-z'’\-]*)$")
+_NAME_TOKEN = re.compile(r"^(?:[^\W\d_][^\W\d_]*(?:(?:['’.-])[^\W\d_]+)*\.?|[^\W\d_])$", re.UNICODE)
 _ENGINEERING_WORDS = frozenset(
     "steel aluminum aluminium brass copper bronze stainless plastic nylon delrin abs pvc iron cast alloy mild zinc "
     "chrome nickel titanium rubber ptfe teflon acetal hdpe ldpe glass wood paint anodize anodized plated "
@@ -185,8 +186,10 @@ def _split_lines(lines: list[Line]) -> list[Line]:
             trail = len(seg.rstrip())
             if seg.strip():
                 s0, s1 = start + lead, start + trail
-                out.append(Line(ln.page, ln.text[s0:s1], ln.boxes[s0:s1], ln.dir, ln.size, ln.color, ln.font,
-                                ln.origins[s0] if ln.origins else ln.origin, ln.origins[s0:s1]))
+                extra = {"confs": ln.confs[s0:s1]} if getattr(ln, "confs", None) else {}
+                out.append(dataclasses.replace(ln, text=ln.text[s0:s1], boxes=ln.boxes[s0:s1],
+                                               origin=ln.origins[s0] if ln.origins else ln.origin,
+                                               origins=ln.origins[s0:s1], **extra))
             start = b
     return out
 
@@ -239,8 +242,7 @@ def valid_value(kind: str, value: str) -> bool:
     if kind == "person":
         if len(toks) > 4 or not all(_NAME_TOKEN.match(t) for t in toks):
             return False
-        letters = re.sub(r"[^A-Za-zÀ-ÿ]", "", v)
-        if len(letters) < 2 or all(t.lower().strip(".") in _ENGINEERING_WORDS for t in toks):
+        if sum(ch.isalpha() for ch in v) < 2 or all(t.lower().strip(".") in _ENGINEERING_WORDS for t in toks):
             return False
         return True
     if kind in ("org", "project", "address"):
