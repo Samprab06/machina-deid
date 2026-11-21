@@ -217,6 +217,14 @@ class BatchResult:
         return dict(self.__dict__)
 
 
+_PASS2_ONLY = re.compile(r"^step:DATA\.(?:PERSON\.|ORGANIZATION\.0)")
+
+
+def is_pass2_only(c: Candidate) -> bool:
+    """Candidates added in attempt 2 for transform-time lookup of existing approvals only."""
+    return bool(_PASS2_ONLY.match(c.location))
+
+
 def discover_batch(cat: IdentityCatalog, items: list[tuple[str | Path, str]], *, limit: int,
                    max_bytes: int | None = None, auto: bool = True, include_paths: bool = False,
                    workers: int = 1) -> BatchResult:
@@ -272,6 +280,9 @@ def _record_discovered(cat: IdentityCatalog, discovered, res: BatchResult, auto:
                     res.failures[d.reason] = res.failures.get(d.reason, 0) + 1
                 continue
             res.ok += 1
+            # Attempt-2 DATA positions are pass-2 lookups only: never recorded/decided in pass 1, so the
+            # catalog (and first-decision-wins approvals) is exactly what attempt-1 discovery produced.
+            d.candidates = [c for c in d.candidates if not is_pass2_only(c)]
             res.candidates += len(d.candidates)
             res.new_observations += cat.record_candidates(d.candidates, source_sha256=d.sha256, path=d.path)
             if auto:

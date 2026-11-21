@@ -110,3 +110,18 @@ def test_numeric_and_short_ids_are_not_candidates(tmp_path):
     vals = {c.value for c in discover_step(src) if c.kind == "org_name"}
     assert "12345" not in vals and all(tp.auto_decision(c)[0] == "review"
                                        for c in discover_step(src) if c.kind == "org_name")
+
+
+def test_pass2_only_candidates_do_not_change_pass1_approvals(tmp_path):
+    # file A carries the person only in DATA PERSON; file B has it as FILE_NAME author. In pass 1, A's
+    # DATA candidate must not create a first decision that blocks B's author approval.
+    a, b = tmp_path / "a.stp", tmp_path / "b.stp"
+    # (ORGANIZATION.name is an attempt-1 pass-1 candidate, so keep the person only in PERSON positions)
+    a.write_bytes(stp(author="('')", org="('')").replace(b"'Acme Widgets Inc','Jane Quincy Doe'",
+                                                         b"$,'Other Org Name'"))
+    b.write_bytes(stp())
+    with IdentityCatalog(tmp_path / "c.db", SECRET) as cat:
+        tp.discover_batch(cat, [(a, "a.stp"), (b, "b.stp")], limit=10)
+        assert cat.approved_pseudonym(PERSON) is not None
+        o = tp.transform_file(cat, a, tmp_path / "oa.stp", "a.stp")  # cross-file corroborated in pass 2
+        assert o.status == "transformed" and o.changes.step_data_replacements >= 3, o.reason

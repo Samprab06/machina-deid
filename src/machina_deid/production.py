@@ -99,6 +99,13 @@ class Config:
     check_git: bool = True
     stop_after_outputs: int = 0  # testing/interruption drills: stop cleanly after N new outputs
     commit_every: int = 32
+    # Attempt 2+: reuse byte-identical outputs of a finished reference attempt via hardlinks (read only).
+    reuse_from: str = ""
+    repo_override: Path | None = None  # attempt 2+: separate checkout; never the live attempt's repo
+
+    @property
+    def ref_corpus(self) -> Path | None:
+        return self.root / "attempts" / self.reuse_from / "corpus" if self.reuse_from else None
 
     @property
     def input(self) -> Path:
@@ -106,7 +113,7 @@ class Config:
 
     @property
     def repo(self) -> Path:
-        return self.root / "repo"
+        return self.repo_override or self.root / "repo"
 
     @property
     def ops(self) -> Path:
@@ -472,9 +479,29 @@ def _stage_name(rel: str) -> str:
         PurePosixPath(rel).suffix.lower()[:16]
 
 
+def _ref_identity(ref_corpus: str, rel: str, size: int, digest: str) -> dict | None:
+    """Read-only: the reference attempt's output for ``rel`` if it is a regular file whose streamed sha256
+    equals ``digest``. Returns its inode identity so the parent can prove the link targets those bytes."""
+    if not ref_corpus:
+        return None
+    ref = Path(ref_corpus) / rel
+    try:
+        st = os.lstat(ref)
+    except OSError:
+        return None
+    import stat as _stat
+    if not _stat.S_ISREG(st.st_mode) or st.st_size != size or hash_file(ref)[0] != digest:
+        return None
+    st2 = os.lstat(ref)
+    if (st2.st_ino, st2.st_size, st2.st_mtime_ns) != (st.st_ino, st.st_size, st.st_mtime_ns):
+        return None  # changed while hashing: do not link
+    return {"link": str(ref), "ino": st.st_ino, "dev": st.st_dev, "mtime_ns": st.st_mtime_ns}
+
+
 def _transform_task(input_root: str, staging: str, rel: str, size: int, md5: str, verify_md5: bool,
-                    crash: str = "") -> dict:
-    """Worker: produce one staged, fsynced output. Never writes outside ``staging``."""
+                    crash: str = "", ref_corpus: str = "") -> dict:
+    """Worker: produce one staged, fsynced output (or a verified reference to identical bytes).
+    Never writes outside ``staging``; the reference corpus is only read."""
     src = verified_input(Path(input_root), rel, size)
     if src is None:
         return {"error": "input_changed_after_discovery"}
@@ -501,8 +528,17 @@ def _transform_task(input_root: str, staging: str, rel: str, size: int, md5: str
         status = "unsupported_passthrough"
     if status != "transformed":
         stage.unlink(missing_ok=True)
+        ref = _ref_identity(ref_corpus, rel, size, before)
+        if ref is not None:  # identical bytes already exist in the reference attempt: no copy
+            return {"status": status, "size": size, "digest": before, "stage": "", **ref, **detail}
         shutil.copyfile(src, stage)
     digest = hash_file(stage)[0]
+    if status == "transformed":
+        ref = _ref_identity(ref_corpus, rel, stage.stat().st_size, digest)
+        if ref is not None:
+            size_out = stage.stat().st_size
+            stage.unlink(missing_ok=True)
+            return {"status": status, "size": size_out, "digest": digest, "stage": "", **ref, **detail}
     if status != "transformed" and digest != before:
         stage.unlink(missing_ok=True)
         return {"error": "passthrough_not_byte_identical"}
@@ -528,6 +564,26 @@ def _passthrough_in_parent(cfg: Config, row) -> dict:
             "reason": "worker_crash", "residual_approved": 0, "fields_replaced": 0, "fully_clean": 0}
 
 
+class LinkError(RunnerError):
+    pass
+
+
+def link_reference(ref: Path, output: Path, r: dict) -> None:
+    """Atomically place a hardlink to the verified reference inode at ``output``.
+
+    Never opens the reference (or the new name) for writing, never chmod/utime. The link is created under a
+    temporary name in the output directory, its inode/size/mtime are checked against what the worker hashed,
+    then ``os.replace`` swaps the directory entry (an existing output name is unlinked, never truncated)."""
+    tmp = output.with_name(f".{output.name}.{os.getpid()}.lnk")
+    tmp.unlink(missing_ok=True)
+    os.link(ref, tmp, follow_symlinks=False)
+    st = os.lstat(tmp)
+    if (st.st_ino, st.st_dev, st.st_size, st.st_mtime_ns) != (r["ino"], r["dev"], r["size"], r["mtime_ns"]):
+        tmp.unlink()
+        raise LinkError("reference output changed after verification")
+    os.replace(tmp, output)
+
+
 class _Committer:
     def __init__(self, cfg: Config, ledger):
         self.cfg, self.ledger, self.pending, self.new = cfg, ledger, 0, 0
@@ -538,7 +594,10 @@ class _Committer:
         if output.parent not in self.made_dirs:
             output.parent.mkdir(parents=True, exist_ok=True)
             self.made_dirs.add(output.parent)
-        os.replace(r["stage"], output)
+        if r.get("link"):
+            link_reference(Path(r["link"]), output, r)
+        else:
+            os.replace(r["stage"], output)
         fsync_dir(output.parent)
         self.ledger.execute("INSERT INTO output VALUES (?, ?, ?, ?)", (row.path, r["status"], r["size"], r["digest"]))
         self.ledger.execute("INSERT OR REPLACE INTO output_detail VALUES (?, ?, ?, ?, ?)",
@@ -582,7 +641,11 @@ def _run_pool(cfg: Config, todo, committer: _Committer, errors: Counter, workers
         if "error" in r:
             errors[r["error"]] += 1
             return True
-        committer.commit_result(row, r)
+        try:
+            committer.commit_result(row, r)
+        except LinkError:
+            errors["reference_changed"] += 1  # not recorded; retried on resume
+            return True
         if committer.new % 500 == 0:
             log(f"Output checkpoint: +{committer.new:,} this session")
         if cfg.stop_after_outputs and committer.new >= cfg.stop_after_outputs:
@@ -614,7 +677,8 @@ def _run_pool(cfg: Config, todo, committer: _Committer, errors: Counter, workers
                     break
                 require_space(cfg)
                 try:
-                    fut = ex.submit(_transform_task, *args0, nxt.path, nxt.size, nxt.md5, cfg.verify_md5, crash)
+                    fut = ex.submit(_transform_task, *args0, nxt.path, nxt.size, nxt.md5, cfg.verify_md5, crash,
+                                    str(cfg.ref_corpus) if cfg.ref_corpus else "")
                 except BrokenProcessPool:
                     return broken()  # nxt was not submitted: it stays in ``rest``
                 inflight[fut] = (nxt, h)
@@ -642,6 +706,11 @@ def assemble(cfg: Config, rows, ledger) -> Counter:
     cfg.corpus.mkdir(parents=True, exist_ok=True)
     if os.stat(cfg.staging).st_dev != os.stat(cfg.corpus).st_dev:
         raise RunnerError("staging and corpus must be on the same filesystem")
+    if cfg.ref_corpus is not None:
+        if cfg.reuse_from == cfg.attempt or not cfg.ref_corpus.is_dir():
+            raise RunnerError("reference attempt corpus is missing or is this attempt")
+        if os.stat(cfg.ref_corpus).st_dev != os.stat(cfg.corpus).st_dev:
+            raise RunnerError("reference corpus must be on the corpus filesystem for hardlink reuse")
     log(f"Transform resume: {len(done):,}/{len(rows):,} outputs recorded; workers={cfg.workers}")
     committer, errors = _Committer(cfg, ledger), Counter()
     try:
@@ -849,6 +918,59 @@ def migrate(cfg: Config, from_revision: str, to_revision: str) -> dict:
         return {"migrated": True, **record}
 
 
+def adopt(cfg: Config, from_attempt: str) -> dict:
+    """Seed this attempt's private state from a finished attempt's *frozen* discovery: catalog, pseudonym
+    store, seed and discovery rows are copied (source opened read only, never modified), and the copy must
+    reproduce the source's frozen catalog digest. Pass-1 semantics are unchanged at attempt 2 (new STEP DATA
+    candidates are pass-2 lookups only), so no new discovery or policy validation is needed. Refuses if this
+    attempt already has any state beyond a lock."""
+    if not from_attempt or from_attempt == cfg.attempt or "/" in from_attempt or from_attempt.startswith("."):
+        raise RunnerError("invalid source attempt")
+    src = Config(root=cfg.root, attempt=from_attempt)
+    if other_runner_processes():
+        raise RunnerError("a runner process is still running; stop it first")
+    with RunLock(cfg):
+        if any((cfg.private / n).exists() for n in ("ledger.sqlite", "catalog.sqlite", "seed", "revision")):
+            raise RunnerError("target attempt already has private state")
+        if cfg.corpus.exists() and any(cfg.corpus.iterdir()):
+            raise RunnerError("target corpus is not empty")
+        sl = sqlite3.connect(f"{(src.private / 'ledger.sqlite').resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            frozen = meta_get(sl, "catalog_digest")
+            disc = sl.execute("SELECT path, status FROM discovery ORDER BY rowid").fetchall()
+        finally:
+            sl.close()
+        if frozen is None:
+            raise RunnerError("source catalog was never frozen")
+        if catalog_digest(src) != frozen:
+            raise RunnerError("source catalog does not match its frozen digest")
+        tmp = cfg.private / "adopt.partial"
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        tmp.mkdir()
+        for name in ("catalog.sqlite", src.store_path.name, "seed"):
+            if (src.private / name).exists():
+                shutil.copyfile(src.private / name, tmp / name)  # read-only on the source; bytes only
+                fsync_file(tmp / name)
+        probe = Config(root=cfg.root, attempt=cfg.attempt)
+        for name in ("catalog.sqlite", src.store_path.name, "seed"):
+            if (tmp / name).exists():
+                os.replace(tmp / name, cfg.private / name)
+        tmp.rmdir()
+        if catalog_digest(probe) != frozen:
+            raise RunnerError("adopted catalog digest mismatch")
+        ledger = open_ledger(cfg)
+        try:
+            ledger.executemany("INSERT INTO discovery VALUES (?, ?)", disc)
+            ledger.execute("INSERT INTO runner_meta VALUES ('catalog_digest', ?)", (frozen,))
+            ledger.execute("INSERT INTO runner_meta VALUES ('adopted_from', ?)", (from_attempt,))
+            ledger.commit()
+        finally:
+            ledger.close()
+        fsync_dir(cfg.private)
+        return {"adopted_from": from_attempt, "discovery_rows": len(disc), "catalog_digest_verified": True}
+
+
 def rollback(cfg: Config) -> dict:
     """Re-pin the source revision recorded by :func:`migrate`, only while no output exists."""
     if other_runner_processes():
@@ -871,12 +993,15 @@ def rollback(cfg: Config) -> dict:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("command", choices=("run", "discover", "status", "migrate", "rollback-migration"))
+    p.add_argument("command", choices=("run", "discover", "status", "migrate", "rollback-migration", "adopt"))
     p.add_argument("--root", type=Path, default=Config.root)
     p.add_argument("--attempt", default="attempt-1")
     p.add_argument("--expected-rows", type=int, default=OFFICIAL_ROWS)
     p.add_argument("--expected-revision", default="")
     p.add_argument("--from-revision", default="")
+    p.add_argument("--repo", type=Path, default=None, help="checkout to pin (default <root>/repo)")
+    p.add_argument("--from-attempt", default="", help="adopt: source attempt with a frozen catalog")
+    p.add_argument("--reuse-from", default="", help="hardlink byte-identical outputs of this finished attempt")
     p.add_argument("--workers", type=int, default=Config.workers)
     p.add_argument("--discovery-workers", type=int, default=0)
     p.add_argument("--batch-files", type=int, default=256)
@@ -899,7 +1024,7 @@ def main(argv=None, script: Path | None = None) -> int:
                  workers=a.workers, discovery_workers=a.discovery_workers, batch_files=a.batch_files,
                  batch_bytes=a.batch_bytes, heavy_bytes=a.heavy_bytes, heavy_slots=a.heavy_slots,
                  reserve_bytes=a.reserve_bytes, poll_seconds=a.poll_seconds, verify_md5=not a.no_verify_md5,
-                 stop_after_outputs=a.stop_after_outputs)
+                 stop_after_outputs=a.stop_after_outputs, reuse_from=a.reuse_from, repo_override=a.repo)
     try:
         if a.command in ("run", "discover"):
             if not a.expected_revision:
@@ -907,6 +1032,8 @@ def main(argv=None, script: Path | None = None) -> int:
             out = run(cfg, script=script, discovery_only=a.command == "discover", package_output=not a.no_package)
         elif a.command == "migrate":
             out = migrate(cfg, a.from_revision, a.expected_revision)
+        elif a.command == "adopt":
+            out = adopt(cfg, a.from_attempt)
         elif a.command == "rollback-migration":
             out = rollback(cfg)
         else:
