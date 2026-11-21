@@ -227,7 +227,7 @@ class Scope:
 
     # -------------------------------------------------------------- OLE
     def ole_alias(self, value: str, pseudonym: str) -> str:
-        if len(pseudonym) == len(value) and pseudonym != value and pseudonym.isascii():
+        if pseudonym != value and ot.widths_match(value, pseudonym):
             return pseudonym
         return ot.equal_length_alias(value, self._alias_key)
 
