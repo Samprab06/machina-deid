@@ -115,3 +115,32 @@ def test_no_findings_means_no_output(tmp_path):
     d.save(tmp_path / "a.pdf")
     r = transform_pdf_scoped(tmp_path / "a.pdf", tmp_path / "b.pdf", Resolver(SECRET, derive=True))
     assert not r.ok and r.reason == "no_resolved_identities" and not (tmp_path / "b.pdf").exists()
+
+def test_corpus_lookup_does_not_replace_bare_single_words(tmp_path):
+    from machina_deid.pdf_entities import EntityMapBuilder, Resolver
+    from machina_deid.pdf_scoped import ScopedResult, plan_page
+    from machina_deid.pdf_titleblock import page_lines, scan_page_lines
+
+    secret = b"synthetic-scope-regression-key"
+    map_path = tmp_path / "entities.sqlite"
+    builder = EntityMapBuilder(secret)
+    with pymupdf.open() as doc:
+        page = doc.new_page()
+        page.insert_text((100, 100), "DRAWN BY: Link")
+        observations = scan_page_lines(page_lines(page))
+        for name in ("A/first.pdf", "B/second.pdf"):
+            builder.add_document(name, observations)
+    builder.freeze(map_path)
+
+    resolver = Resolver(secret, map_path)
+    try:
+        assert resolver.lookup("Link")
+        with pymupdf.open() as doc:
+            page = doc.new_page()
+            page.insert_text((100, 100), "Secure Link with dowel pin")
+            assert not plan_page(page, resolver, ScopedResult())
+            page.insert_text((100, 200), "DRAWN BY: Link")
+            edits = plan_page(page, resolver, ScopedResult())
+            assert len(edits) == 1 and edits[0].source == "inline"
+    finally:
+        resolver.close()

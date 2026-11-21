@@ -118,6 +118,26 @@ def _choose_text(new: str, fit: str, avail: float, size: float) -> tuple[str, fl
     return fit, max(size * MIN_SCALE, min(size, avail / w1)), True  # may overflow the extent; still readable
 
 
+_CONTEXTUAL_KINDS = frozenset({"person", "org", "project", "account", "address"})
+_PERSON_CUE = re.compile(r"\b(?:attention|questions to|contact|reviewed by|prepared by|approved by)\s*[:=]?\s*$")
+
+
+def _lookup_in_context(value: str, container: str, resolver: Resolver):
+    """Use context-free lookup only for structured identifiers."""
+    match = resolver.lookup(value)
+    if match and match[0] in _CONTEXTUAL_KINDS:
+        candidate = _normalize(value)
+        text = _normalize(container).strip(" :;,|")
+        if len(candidate.split()) < 2:
+            return None
+        if text != candidate:
+            if match[0] != "person" or not text.endswith(candidate):
+                return None
+            if not _PERSON_CUE.search(text[:-len(candidate)]):
+                return None
+    return match
+
+
 def plan_page(page, resolver: Resolver, res: ScopedResult, ocr_lines=None, *, min_conf: float = 70.0) -> list[Edit]:
     """Findings -> resolved, non-overlapping edits. ``ocr_lines`` (textless pages) replace extracted text;
     an OCR finding counts only if every character of its span was read at ``min_conf`` or better."""
@@ -161,6 +181,8 @@ def plan_page(page, resolver: Resolver, res: ScopedResult, ocr_lines=None, *, mi
         add(f, entry)
     # unlabelled occurrences: frozen map + values already resolved in this document (duplicates)
     for f in lookup_findings(lines, resolver.lookup):
+        if not _lookup_in_context(f.value, f.line.text, resolver):
+            continue
         if is_ocr and min((getattr(f.line, "confs", None) or [0.0])[f.start:f.end] or [0.0]) < min_conf:
             res.ocr["finding_low_confidence"] += 1
             continue
@@ -369,7 +391,7 @@ def _lookup_document_strings(doc, resolver: Resolver) -> None:
     from .pdf_titleblock import ngram_spans
     for s in _document_strings(doc):
         for a, b in ngram_spans(s):
-            if len(_normalize(s[a:b])) >= 4 and resolver.lookup(s[a:b]):
+            if len(_normalize(s[a:b])) >= 4 and _lookup_in_context(s[a:b], s, resolver):
                 resolver.local.setdefault(_normalize(s[a:b]), resolver.entry(s[a:b]))
 
 
