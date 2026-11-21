@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import itertools
+import math
 import json
 import random
 import re
@@ -331,7 +332,8 @@ def _metrics(occs: list[Occ], eng: dict, max_pairs: int, rng_seed: int) -> dict:
     for o in occs:
         if o.label.entity:
             ents[o.label.entity].append(o)
-    pairs = [p for e in ents.values() for p in itertools.combinations(e, 2)]
+    pairs = [(a, b) for group in ents.values() for a, b in itertools.combinations(group, 2)
+             if a.label.doc != b.label.doc]
     if len(pairs) > max_pairs:
         pairs = rng.sample(pairs, max_pairs)
     pair_ok = sum(a.ok and b.ok and a.token == b.token for a, b in pairs)
@@ -346,6 +348,21 @@ def _metrics(occs: list[Occ], eng: dict, max_pairs: int, rng_seed: int) -> dict:
     if len(trip) > max_pairs:
         trip = rng.sample(trip, max_pairs)
     trip_ok = sum(all(o.ok for o in t) and len({o.token for o in t}) == 1 for t in trip)
+    entity_ids = sorted(ents)
+    possible_triplets = math.comb(len(entity_ids), 3)
+    distinct_total = min(possible_triplets, max_pairs)
+    if distinct_total == possible_triplets:
+        triples = itertools.combinations(entity_ids, 3)
+    else:
+        samples: set[tuple[str, str, str]] = set()
+        while len(samples) < distinct_total:
+            a, b, c = sorted(rng.sample(entity_ids, 3))
+            samples.add((a, b, c))
+        triples = iter(sorted(samples))
+    distinct_ok = 0
+    for triple in triples:
+        examples = [rng.choice(ents[entity]) for entity in triple]
+        distinct_ok += all(o.ok and o.token for o in examples) and len({o.token for o in examples}) == 3
     tok_ents: dict[str, set] = defaultdict(set)
     for o in occs:
         if o.ok and o.label.entity:
@@ -360,6 +377,8 @@ def _metrics(occs: list[Occ], eng: dict, max_pairs: int, rng_seed: int) -> dict:
         "same_identity": {"ok": pair_ok, "total": len(pairs), "rate": round(pair_ok / len(pairs), 4) if pairs else None},
         "cross_document_triplets": {"ok": trip_ok, "total": len(trip),
                                     "rate": round(trip_ok / len(trip), 4) if trip else None},
+        "distinct_identity_triplets": {"ok": distinct_ok, "total": distinct_total,
+                                       "rate": round(distinct_ok / distinct_total, 4) if distinct_total else None},
         "distinctness_collisions": collisions,
         "engineering": {"docs_ok": eng_ok, "docs": len(eng),
                         "reasons": dict(Counter(v.get("reason", "") for v in eng.values() if not v.get("ok"))),
