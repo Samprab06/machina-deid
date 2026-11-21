@@ -25,6 +25,15 @@ CONFIDENCES = ("high", "medium", "low")
 
 _PLACEHOLDERS = {"", "unknown", "none", "n/a", "na", "null", "anonymous", "-", "--", "tbd", "undefined",
                  "unspecified", "not specified", "$", "*", "user", "default", "admin", "administrator"}
+# Exact structural field labels (header keys, metadata keys, attribute tags). A value equal to one of these
+# is the field's own name echoed as its content (e.g. STEP ``FILE_NAME(..., ('author'), ...)``), never an identity.
+_STRUCTURAL_LABELS = {"author", "authors", "organization", "organisation", "organizations", "organisations",
+                      "name", "file name", "filename", "title", "subject", "keywords", "company", "creator",
+                      "producer", "owner", "designer", "drawn by", "designed by", "checked by", "approved by",
+                      "created by", "prepared by", "engineer", "customer", "client", "supplier",
+                      "manufacturer", "contact", "originator", "project", "project name", "description",
+                      "authorization", "originating system", "preprocessor", "lastsavedby", "$lastsavedby",
+                      "projectname", "$projectname"}
 _NUMERIC_LIKE = re.compile(r"^[\s\d.,:;/\\+\-±°%()xX*×Ø⌀R]*$")
 _TIMESTAMP_LIKE = re.compile(r"\b\d{4}[-/.]\d{2}[-/.]\d{2}\b|\b\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}\b|\bD:\d{8,}")
 _TOLERANCE_LIKE = re.compile(r"[±]|\b\d+(\.\d+)?\s*(mm|in|deg|°)\b|\bM\d+(x\d+(\.\d+)?)?\b|\bØ|⌀", re.I)
@@ -89,6 +98,8 @@ def _plausible(value: str, *, min_len: int = 2, max_len: int = 120) -> str | Non
     v = value.strip()
     if normalize(v) in _PLACEHOLDERS:
         return "placeholder"
+    if re.sub(r"[\s_:\-=.]+", " ", normalize(v)).strip() in _STRUCTURAL_LABELS:
+        return "structural_label"
     if len(v) < min_len or len(v) > max_len:
         return "length"
     if not any(ch.isalpha() for ch in v):
@@ -106,10 +117,17 @@ def _plausible(value: str, *, min_len: int = 2, max_len: int = 120) -> str | Non
     return None
 
 
+def _echoes_structure(value: str, location: str, reason: str) -> bool:
+    """True if ``value`` is contained in its own (fixed, value-free) location or reason text: it is then
+    structural vocabulary, not an identity, and must never reach the catalog (which rejects it)."""
+    n = normalize(value)
+    return len(n) >= 3 and (n in normalize(location) or n in normalize(reason))
+
+
 def _mk(out: list[Candidate], kind: str, value: str, location: str, confidence: str, reason: str,
         include_software: bool = False) -> None:
     v = value.strip()
-    if _plausible(v):
+    if _plausible(v) or _echoes_structure(v, location, reason):
         return
     if not include_software and _SOFTWARE.search(v):
         return
@@ -160,9 +178,9 @@ def discover_step(path: str | Path, *, include_software: bool = False, include_t
         except StepDataError:
             names = []  # DATA not structurally parseable: no DATA candidates, and DATA is never transformed
         for k, (_, value) in enumerate(names):
-            if _plausible(value) is None:  # exact value kept (not stripped) so transform matching is exact
-                out.append(Candidate("org_name", value, f"step:DATA.ORGANIZATION.name[{k}]", "medium",
-                                     "ISO 10303-41 ORGANIZATION.name in DATA; requires typed org approval"))
+            loc, why = f"step:DATA.ORGANIZATION.name[{k}]", "ISO 10303-41 ORGANIZATION.name in DATA; requires typed org approval"
+            if _plausible(value) is None and not _echoes_structure(value, loc, why):  # exact value kept (not stripped) so transform matching is exact
+                out.append(Candidate("org_name", value, loc, "medium", why))
     return out
 
 

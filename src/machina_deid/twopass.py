@@ -86,6 +86,9 @@ def _discover_zip(zf: zipfile.ZipFile, prefix: str, depth: int, budget, work: Pa
         if info.is_dir():
             continue
         name = f"{prefix}!{info.filename}"
+        if ar.is_metadata_sidecar(info.filename):
+            out.append(DiscoveredFile(name, None, "", "unsupported", "metadata_sidecar"))
+            continue
         fmt = _member_fmt(info.filename)
         if fmt is None or ar._is_symlink(info):
             out.append(DiscoveredFile(name, None, "", "unsupported", "unsupported_member"))

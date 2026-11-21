@@ -37,6 +37,12 @@ from pathlib import Path, PurePosixPath
 
 from .idmap import IdentityMap
 
+def is_metadata_sidecar(name: str) -> bool:
+    """AppleDouble/resource-fork sidecars (``__MACOSX/...`` or ``._*``): metadata, never the named format."""
+    parts = [p for p in name.replace("\\", "/").split("/") if p]
+    return bool(parts) and ("__MACOSX" in parts[:-1] or parts[0] == "__MACOSX" or parts[-1].startswith("._"))
+
+
 SUPPORTED = {".pdf": "pdf", ".dxf": "dxf", ".step": "step", ".stp": "step"}
 NESTED = {".zip"}
 
@@ -290,6 +296,10 @@ def _rebuild(zin: zipfile.ZipFile, zout: zipfile.ZipFile, depth: int, ctx: _Ctx,
             rep.outcome = "directory_preserved"
         elif _is_symlink(info):
             rep.outcome, rep.reason = "unsupported_passthrough", "symlink"
+        elif is_metadata_sidecar(info.filename):
+            rep.outcome, rep.reason = "unsupported_passthrough", "metadata_sidecar"
+            if ctx.idmap is not None:
+                rep.residual = _scan(data, ctx.idmap)
         elif rep.ext in NESTED:
             new = _nested(data, depth + 1, ctx, rep)
         elif kind is None:
