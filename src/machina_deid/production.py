@@ -107,6 +107,9 @@ class Config:
     # worst case < minimum, submission stops, in-flight files drain, and the run exits resumable.
     host_space_path: Path | None = None
     host_min_free_bytes: int = 0
+    # Attempt 2c: frozen shared PDF/OLE identity scope (pass 1.5). Pinned per attempt in the ledger.
+    scope: bool = True
+    scope_ocr: bool = False
 
     @property
     def ref_corpus(self) -> Path | None:
@@ -499,12 +502,60 @@ def freeze_catalog(cfg: Config, ledger) -> str:
 # ------------------------------------------------------------------ transform
 
 _CAT = None
+_SCOPE = None
+SCOPE_KEY = "entity_map_digest"
+SCOPE_OFF = "disabled"
 
 
-def _init_transform_worker(catalog_path: str, seed_path: str) -> None:
-    global _CAT
+def _init_transform_worker(catalog_path: str, seed_path: str, scope_digest: str = "") -> None:
+    global _CAT, _SCOPE
     from .catalog import IdentityCatalog
-    _CAT = IdentityCatalog(catalog_path, Path(seed_path).read_bytes(), read_only=True)
+    seed = Path(seed_path).read_bytes()
+    _CAT = IdentityCatalog(catalog_path, seed, read_only=True)
+    if scope_digest and scope_digest != SCOPE_OFF:
+        from .scope import scope_from_state
+        _SCOPE = scope_from_state(Path(seed_path).parent, seed, scope_digest)
+        if _SCOPE is None:
+            raise RunnerError("frozen entity map is missing")
+
+
+def ensure_scope(cfg: Config, rows, ledger) -> str:
+    """Pass 1.5: build and pin the frozen shared PDF/OLE entity map once per attempt (idempotent).
+
+    The mode is pinned on first use; a resumed run with a different ``--no-scope`` setting is refused so an
+    attempt never mixes scoped and unscoped outputs."""
+    from .scope import MAP_NAME, build_scope
+    pinned = meta_get(ledger, SCOPE_KEY)
+    want_off = not cfg.scope
+    if pinned is not None:
+        if (pinned == SCOPE_OFF) != want_off:
+            raise RunnerError("scope mode differs from the mode pinned for this attempt")
+        if pinned != SCOPE_OFF and not (cfg.private / MAP_NAME).exists():
+            raise RunnerError("pinned entity map is missing")
+        return pinned
+    if ledger.execute("SELECT COUNT(*) FROM output").fetchone()[0]:
+        raise RunnerError("outputs exist without a pinned scope mode; rerun with --no-scope or a new attempt")
+    if want_off:
+        digest = SCOPE_OFF
+    else:
+        from .catalog import IdentityCatalog
+        path = cfg.private / MAP_NAME
+        if path.exists():  # an interrupted earlier build froze but did not pin: rebuild deterministically
+            path.unlink()
+        items = [(cfg.input / r.path, r.path) for r in rows]
+        log(f"Scope build (PDF/OLE shared identity map) over {len(items):,} rows")
+        cat = IdentityCatalog(cfg.catalog_path, (cfg.private / "seed").read_bytes(), read_only=True)
+        try:
+            stats = build_scope(path, (cfg.private / "seed").read_bytes(), items, catalog=cat,
+                                workers=cfg.discovery_workers or cfg.workers, ocr=cfg.scope_ocr)
+        finally:
+            cat.close()
+        atomic_write(cfg.private / "scope-stats.json", json.dumps(stats, sort_keys=True) + "\n")
+        log("Scope frozen: " + json.dumps({k: v for k, v in stats.items() if k != "digest"}, sort_keys=True))
+        digest = stats["digest"]
+    ledger.execute("INSERT INTO runner_meta VALUES (?, ?)", (SCOPE_KEY, digest))
+    ledger.commit()
+    return digest
 
 
 def _stage_name(rel: str) -> str:
@@ -546,9 +597,9 @@ def _transform_task(input_root: str, staging: str, rel: str, size: int, md5: str
     stage = Path(staging) / _stage_name(rel)
     stage.unlink(missing_ok=True)
     detail = {"reason": "", "residual_approved": 0, "fields_replaced": 0, "fully_clean": 0}
-    if twopass.detect_format(src):
+    if twopass.handles(src, _SCOPE):
         try:
-            res = twopass.transform_file(_CAT, src, stage, rel)
+            res = twopass.transform_file(_CAT, src, stage, rel, scope=_SCOPE)
             status = res.status
             detail.update(reason=res.reason[:200], residual_approved=res.residual_approved,
                           fields_replaced=res.fields_replaced, fully_clean=int(res.fully_clean))
@@ -669,7 +720,8 @@ def _run_pool(cfg: Config, todo, committer: _Committer, errors: Counter, workers
     args0 = (str(cfg.input), str(cfg.staging))
     crash = os.environ.get(TEST_CRASH_ENV, "")
     seed = str(cfg.private / "seed")
-    ex = pool(workers, cfg, _init_transform_worker, (str(cfg.catalog_path), seed))
+    scope_digest = meta_get(committer.ledger, SCOPE_KEY) or ""
+    ex = pool(workers, cfg, _init_transform_worker, (str(cfg.catalog_path), seed, scope_digest))
     inflight: dict = {}
     heavy_now, it, nxt = 0, iter(todo), None
 
@@ -912,6 +964,7 @@ def run(cfg: Config, *, script: Path | None = None, discovery_only: bool = False
             if ledger.execute("SELECT COUNT(*) FROM discovery").fetchone()[0] != len(rows):
                 raise RunnerError("discovery is incomplete; transformation needs the complete catalog")
             freeze_catalog(cfg, ledger)
+            ensure_scope(cfg, rows, ledger)
             session: dict = {}
             errors = assemble(cfg, rows, ledger, session)
             freeze_catalog(cfg, ledger)  # re-verify nothing touched the catalog
@@ -1076,6 +1129,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--heavy-bytes", type=int, default=256 * 1024**2)
     p.add_argument("--heavy-slots", type=int, default=2)
     p.add_argument("--reserve-bytes", type=int, default=15 * 1024**3)
+    p.add_argument("--no-scope", action="store_true", help="disable the attempt-2c shared PDF/OLE scope")
+    p.add_argument("--scope-ocr", action="store_true", help="OCR textless PDF pages during the scope build")
     p.add_argument("--host-space-path", type=Path, default=None,
                    help="physical host mount backing the workspace (e.g. /mnt/e for a WSL VHDX on E:)")
     p.add_argument("--host-min-free-bytes", type=int, default=0,
@@ -1098,7 +1153,7 @@ def main(argv=None, script: Path | None = None) -> int:
                  batch_bytes=a.batch_bytes, heavy_bytes=a.heavy_bytes, heavy_slots=a.heavy_slots,
                  reserve_bytes=a.reserve_bytes, poll_seconds=a.poll_seconds, verify_md5=not a.no_verify_md5,
                  stop_after_outputs=a.stop_after_outputs, reuse_from=a.reuse_from, repo_override=a.repo,
-                 host_space_path=a.host_space_path, host_min_free_bytes=max(0, a.host_min_free_bytes))
+                 scope=not a.no_scope, scope_ocr=a.scope_ocr, host_space_path=a.host_space_path, host_min_free_bytes=max(0, a.host_min_free_bytes))
     try:
         if a.command in ("run", "discover"):
             if not a.expected_revision:

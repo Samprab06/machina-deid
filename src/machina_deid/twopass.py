@@ -19,6 +19,7 @@ import os
 import re
 import tempfile
 import zipfile
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -565,18 +566,97 @@ def _sum(d: dict) -> int:
     return sum(d.values()) if d else 0
 
 
+def handles(path: str | Path, scope=None) -> bool:
+    """Does pass 2 process this file? (supported format, or a CFB container when a scope is loaded)."""
+    if detect_format(path) is not None:
+        return True
+    from .scope import is_cfb_path
+    return scope is not None and is_cfb_path(path)
+
+
+def _transform_ole(scope, src: Path, dst: Path, out: TransformOutcome, before: str, overwrite: bool):
+    """Attempt 2c: CFB saved-account property + verified cross-stream records via the frozen shared map."""
+    out.format = "cfb"
+    if dst.exists() and not overwrite:
+        raise FileExistsError("output exists")
+    data = src.read_bytes()
+    r = scope.ole(data)
+    out.approved_values = r.mapped
+    out.residual_approved = sum(r.unresolved.values())
+    if r.informative_raw:
+        out.independent_residual["ole_unverified_raw"] = r.informative_raw
+    out.reason = r.reason
+    if r.status == "transformed":
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dst.with_name(dst.name + ".partial")
+        tmp.write_bytes(r.data)
+        os.replace(tmp, dst)
+        out.changes.ole_property_replacements = r.property_writes
+        out.changes.ole_cross_stream_replacements = r.cross_stream_writes
+        out.status, out.output_written = "transformed", True
+    else:
+        out.status = "no_approved_identities" if r.status == "no_identities" else "failed"
+    out.fields_replaced = out.changes.total
+    out.source_unchanged = _sha_file(src) == before
+    out.fully_clean = (out.output_written and not out.residual_approved
+                       and not any(out.independent_residual.values()))
+    return out
+
+
+def _pdf_counts(r) -> TransformCounts:
+    return TransformCounts(pdf_visible_text_replacements=r.edits_verified,
+                           pdf_metadata_identities_changed=r.metadata_replacements,
+                           pdf_form_changes=r.widget_replacements,
+                           pdf_annotation_changes=r.annotation_replacements + r.toc_replacements,
+                           pdf_attachment_changes=r.attachment_replacements)
+
+
+def _transform_pdf_scoped(scope, cat, src: Path, dst: Path, idmap: IdentityMap, out: TransformOutcome) -> str:
+    """Scoped rewrite through the frozen map. Returns "ok", "none" (nothing resolved: caller may use the
+    legacy path) or "failed" (``out.reason`` set; no output kept)."""
+    try:
+        r = scope.pdf(src, dst, dict(idmap.strings))
+    except Exception as exc:  # noqa: BLE001 - classified, never claimed successful
+        dst.unlink(missing_ok=True)
+        out.reason = f"pdf_scoped_exception:{type(exc).__name__}"
+        return "failed"
+    unresolved = sum(r.unresolved.values())
+    if not r.ok:
+        dst.unlink(missing_ok=True)
+        if r.reason == "no_resolved_identities":
+            out.residual_approved += unresolved
+            return "none"
+        out.reason = f"pdf_scoped:{r.reason}"[:120]
+        return "failed"
+    out.changes = _pdf_counts(r)
+    out.approved_values = max(out.approved_values, len(r.resolved_values))
+    out.residual_approved = sum(r.residual.values()) + unresolved
+    if unresolved:
+        out.independent_residual["pdf_unresolved_findings"] = unresolved
+    if not _independent_pdf_check(src, dst, sorted(set(r.resolved_values) | set(idmap.strings)), out):
+        out.reason = "pdf_scoped:" + out.reason
+        return "failed"
+    return "ok"
+
+
 def transform_file(cat: IdentityCatalog, src: str | Path, dst: str | Path, rel_path: str | None = None, *,
-                   overwrite: bool = False) -> TransformOutcome:
-    """Pass 2 for one file: rediscover current candidates, build the approved in-memory map, transform."""
+                   overwrite: bool = False, scope=None) -> TransformOutcome:
+    """Pass 2 for one file: rediscover current candidates, build the approved in-memory map, transform.
+
+    ``scope`` (attempt 2c, :class:`scope.Scope`): frozen shared PDF/OLE entity map; enables CFB files, the
+    scoped PDF rewrite (title blocks, contacts, cross-document lookup) and both inside ZIP archives."""
     src, dst = Path(src), Path(dst)
     rel = rel_path or src.name
     before = _sha_file(src)
-    found = discover_file(src, rel)
     fmt = detect_format(src)
     out = TransformOutcome(rel, fmt, "failed")
     if fmt is None:
+        from .scope import is_cfb_path
+        if scope is not None and is_cfb_path(src):
+            return _transform_ole(scope, src, dst, out, before, overwrite)
         out.status, out.reason = "unsupported", "unsupported_format"
         return out
+    found = discover_file(src, rel)
     if any(d.status == "failed" for d in found) and fmt != "zip":
         out.reason = found[0].reason
         return out
@@ -591,7 +671,22 @@ def transform_file(cat: IdentityCatalog, src: str | Path, dst: str | Path, rel_p
         org_map, org_other = {}, 0
     out.approved_values = st.approved_values + len(org_map) + len(org_map_zip)
     out.residual_approved = org_other
-    if not idmap.strings and not org_map and not org_map_zip:
+    if scope is not None and fmt == "pdf":
+        if dst.exists() and not overwrite:
+            raise FileExistsError("output exists")
+        state = _transform_pdf_scoped(scope, cat, src, dst, idmap, out)
+        if state != "none":
+            ok = state == "ok"
+            out.output_written = ok and dst.exists()
+            if not out.output_written:
+                out.changes = TransformCounts()
+            out.fields_replaced = out.changes.total
+            out.status = "transformed" if ok else "failed"
+            out.source_unchanged = _sha_file(src) == before
+            out.fully_clean = (ok and out.output_written and out.residual_approved == 0
+                               and not any(out.independent_residual.values()))
+            return out
+    if not idmap.strings and not org_map and not org_map_zip and not (scope is not None and fmt == "zip"):
         out.status, out.reason = "no_approved_identities", "nothing approved for current candidates"
         out.source_unchanged = _sha_file(src) == before
         return out
@@ -618,7 +713,7 @@ def transform_file(cat: IdentityCatalog, src: str | Path, dst: str | Path, rel_p
                     out.independent_residual["step_data_literal_substring"] = left
         else:
             idmap = zip_member_map(cat, cands)[0]
-            r = ar.transform_zip(src, dst, idmap, overwrite=overwrite)
+            r = ar.transform_zip(src, dst, idmap, overwrite=overwrite, scope=scope)
             ok = r.ok
             flat = list(ar._walk(r.members))
             if ok:
@@ -630,6 +725,16 @@ def transform_file(cat: IdentityCatalog, src: str | Path, dst: str | Path, rel_p
                 out.archive_replacements = out.changes.total
             out.residual_approved = sum(_sum(m.residual) for m in flat)
             out.reason = r.reason
+            bad = Counter(m.reason.split(":")[0] for m in flat if m.outcome == "identifiers_unmodifiable"
+                          and m.reason.startswith(("pdf_scoped", "ole")))
+            if bad:
+                out.independent_residual.update({f"zip_member_{k}": v for k, v in bad.items()})
+            if ok and scope is not None and out.changes.total == 0:
+                dst.unlink(missing_ok=True)  # nothing rewritten: keep the original archive byte-identical
+                out.status = "failed" if bad else "no_approved_identities"
+                out.reason = out.reason or ("zip_member_rewrite_failed" if bad else "nothing approved for members")
+                out.source_unchanged = _sha_file(src) == before
+                return out
     except (OSError, ValueError) as exc:
         ok, out.reason = False, f"transform_error:{type(exc).__name__}"
     out.output_written = dst.exists() and ok

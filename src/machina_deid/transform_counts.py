@@ -15,6 +15,8 @@ class TransformCounts:
     step_descriptive_replacements: int = 0  # attempt 2b: scoped PRODUCT/structure descriptive literals
     mesh_header_replacements: int = 0  # attempt 2b: STL header/solid name
     svg_metadata_replacements: int = 0  # attempt 2b: SVG RDF/Dublin Core metadata
+    ole_property_replacements: int = 0  # attempt 2c: SummaryInformation saved-account property
+    ole_cross_stream_replacements: int = 0  # attempt 2c: verified MFC CString / path-component records
 
     @property
     def total(self) -> int:
