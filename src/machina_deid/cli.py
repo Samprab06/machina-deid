@@ -165,7 +165,12 @@ def cmd_readiness(a) -> int:
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0 if result["valid"] else 1
     if a.action == "upload-plan":
-        print(json.dumps(rd.upload_plan(a.layout_root, a.destination), indent=2, sort_keys=True))
+        try:
+            plan = rd.upload_plan(a.layout_root, a.destination)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(plan, indent=2, sort_keys=True))
         return 0
     raise SystemExit(f"unknown readiness action: {a.action}")
 
@@ -198,7 +203,7 @@ def cmd_catalog(a) -> int:
                 items.append((phys, rel))
             res = tp.discover_batch(cat, items, limit=a.limit,
                                     max_bytes=mf.parse_size(a.max_bytes) if a.max_bytes else None,
-                                    auto=not a.no_auto)
+                                    auto=not a.no_auto, workers=a.workers)
             print(json.dumps(res.to_dict(), indent=2, sort_keys=True))
         elif a.action == "report":
             print(json.dumps(cat.report(), indent=2, sort_keys=True))
@@ -297,6 +302,8 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--limit", type=int, default=100, help="discover: max files (hard cap 5000)")
     c.add_argument("--max-bytes", help="discover: max source bytes")
     c.add_argument("--no-auto", action="store_true", help="discover: record candidates only")
+    c.add_argument("--workers", type=int, default=1,
+                   help="discover: parse files in N processes; results are still recorded in input order")
     c.add_argument("--kind", default="text", help="approve/reject/review/alias identity kind")
     c.add_argument("--reason", help="short ASCII reason (must not contain the value)")
     c.add_argument("--overwrite", action="store_true")

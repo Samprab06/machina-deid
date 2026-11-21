@@ -218,16 +218,24 @@ class BatchResult:
 
 
 def discover_batch(cat: IdentityCatalog, items: list[tuple[str | Path, str]], *, limit: int,
-                   max_bytes: int | None = None, auto: bool = True, include_paths: bool = False) -> BatchResult:
+                   max_bytes: int | None = None, auto: bool = True, include_paths: bool = False,
+                   workers: int = 1) -> BatchResult:
     """Bounded discovery pass over ``(physical_path, rel_path)`` items.
 
     Each file is recorded in its own transaction, so an interrupted batch keeps completed files and a
     rerun is idempotent (duplicate observations are ignored; existing decisions are never overridden).
     A failing file is counted and the batch continues.
+
+    ``workers > 1`` parses files in worker processes (read-only, no catalog access). The parent still
+    records results strictly in input order, so catalog contents and first-decision-wins auto approvals
+    are identical to a serial run.
     """
     if limit <= 0 or limit > 5000:
         raise ValueError("limit must be in 1..5000")
+    if workers < 1 or workers > 64:
+        raise ValueError("workers must be in 1..64")
     res, used = BatchResult(), 0
+    selected: list[tuple[Path, str]] = []
     for phys, rel in items[:limit]:
         phys = Path(phys)
         size = phys.stat().st_size
@@ -235,8 +243,28 @@ def discover_batch(cat: IdentityCatalog, items: list[tuple[str | Path, str]], *,
             res.skipped_over_budget += 1
             continue
         used += size
+        selected.append((phys, rel))
+    if workers == 1 or len(selected) <= 1:
+        discovered = (discover_file(p, r, include_paths=include_paths) for p, r in selected)
+        _record_discovered(cat, discovered, res, auto)
+    else:
+        from concurrent.futures import ProcessPoolExecutor
+        from functools import partial
+        with ProcessPoolExecutor(max_workers=min(workers, len(selected))) as pool:
+            # map() yields in submission order; a worker exception propagates exactly as in serial mode.
+            discovered = pool.map(partial(_discover_pair, include_paths=include_paths), selected)
+            _record_discovered(cat, discovered, res, auto)
+    return res
+
+
+def _discover_pair(item: tuple[Path, str], *, include_paths: bool) -> list[DiscoveredFile]:
+    return discover_file(item[0], item[1], include_paths=include_paths)
+
+
+def _record_discovered(cat: IdentityCatalog, discovered, res: BatchResult, auto: bool) -> None:
+    for members in discovered:
         res.files += 1
-        for d in discover_file(phys, rel, include_paths=include_paths):
+        for d in members:
             res.members += 1
             if d.status != "ok":
                 setattr(res, d.status, getattr(res, d.status) + 1)
@@ -249,7 +277,6 @@ def discover_batch(cat: IdentityCatalog, items: list[tuple[str | Path, str]], *,
             if auto:
                 for k, v in apply_auto(cat, d.candidates).items():
                     res.decisions[k] = res.decisions.get(k, 0) + v
-    return res
 
 
 # ---------------------------------------------------------------- transformation

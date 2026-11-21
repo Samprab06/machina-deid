@@ -26,7 +26,15 @@ TERMINAL_OUTCOMES = (
     "identifiers_unmodifiable",
     "failed_validation",
 )
-MAX_FILE_BYTES = 2 * 1024**3
+# Organizer rule: "Any single file over 2 GB in corpus/ is skipped during grading."
+# "GB" is read conservatively as decimal (2e9 bytes), which also satisfies 2 GiB.
+MAX_FILE_BYTES = 2_000_000_000
+# Organizer rule: a corpus/ with more than 400,000 objects is rejected.
+MAX_CORPUS_OBJECTS = 400_000
+# Official attempt layout: attempt-N/{corpus/, code/, README.txt}.
+CODE_DIR = "code"
+LEGACY_CODE_DIR = "pipeline-source"  # older local dry-run layouts
+HASH_CHUNK_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -215,6 +223,34 @@ def validate_report(report: dict) -> list[str]:
     return errors
 
 
+def sha256_file(path: str | Path, chunk_bytes: int = HASH_CHUNK_BYTES) -> str:
+    """Hash a file in bounded memory (corpus files may approach 2 GB)."""
+    h = hashlib.sha256()
+    with Path(path).open("rb") as fh:
+        for chunk in iter(lambda: fh.read(chunk_bytes), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def resolve_code_dir(layout_root: str | Path) -> tuple[Path | None, list[str], list[str]]:
+    """Return ``(local code dir, errors, warnings)``.
+
+    ``code/`` is the official name.  A legacy ``pipeline-source/`` dry-run layout is
+    accepted with a warning and is still uploaded to the remote ``code/`` prefix.
+    Having both is ambiguous and is rejected so the wrong tree is never uploaded.
+    """
+    root = Path(layout_root)
+    code, legacy = root / CODE_DIR, root / LEGACY_CODE_DIR
+    if code.exists() and legacy.exists():
+        return None, [f"ambiguous code tree: both {CODE_DIR}/ and {LEGACY_CODE_DIR}/ exist"], []
+    for p, warn in ((code, []), (legacy, [f"legacy {LEGACY_CODE_DIR}/ used; it uploads as {CODE_DIR}/"])):
+        if p.exists() or p.is_symlink():
+            if p.is_symlink() or not p.is_dir():
+                return None, [f"{p.name} is not a real directory"], []
+            return p, [], warn
+    return None, [f"missing {CODE_DIR}"], []
+
+
 def validate_final_layout(layout_root: str | Path, manifest: str | Path, *, report: dict | None = None,
                           max_file_bytes: int = MAX_FILE_BYTES) -> dict:
     """Validate the submission layout and, when present, every recorded output hash."""
@@ -223,9 +259,12 @@ def validate_final_layout(layout_root: str | Path, manifest: str | Path, *, repo
     expected = {e.path: e for e in entries}
     duplicates = sorted(p for p, n in _path_counts(entries).items() if n > 1)
     errors: list[str] = []
-    for name in ("README.txt", "pipeline-source", "corpus"):
-        if not (root / name).exists():
-            errors.append(f"missing {name}")
+    _code, code_errors, warnings = resolve_code_dir(root)
+    errors.extend(code_errors)
+    if not (root / "README.txt").is_file():
+        errors.append("missing README.txt")
+    if not (root / "corpus").is_dir():
+        errors.append("missing corpus")
     corpus = root / "corpus"
     actual: dict[str, Path] = {}
     if corpus.is_dir():
@@ -238,6 +277,8 @@ def validate_final_layout(layout_root: str | Path, manifest: str | Path, *, repo
             actual[rel] = p
             if p.stat().st_size > max_file_bytes:
                 errors.append(f"file exceeds limit: {rel}")
+    if len(actual) > MAX_CORPUS_OBJECTS:
+        errors.append(f"corpus exceeds {MAX_CORPUS_OBJECTS} objects: {len(actual)}")
     missing = sorted(set(expected) - set(actual))
     extra = sorted(set(actual) - set(expected))
     if duplicates:
@@ -257,7 +298,7 @@ def validate_final_layout(layout_root: str | Path, manifest: str | Path, *, repo
             if not p.is_file():
                 errors.append(f"missing recorded output: {row['output_path']}")
             else:
-                digest = hashlib.sha256(p.read_bytes()).hexdigest()
+                digest = sha256_file(p)
                 if digest != row["output_sha256"]:
                     errors.append(f"hash mismatch: {row['output_path']}")
         counts = outcome_counts(report)
@@ -265,7 +306,7 @@ def validate_final_layout(layout_root: str | Path, manifest: str | Path, *, repo
             errors.append(f"pending manifest rows: {counts['pending']}")
         if counts["failed_validation"]:
             errors.append(f"failed manifest rows: {counts['failed_validation']}")
-    return {"valid": not errors, "errors": errors, "manifest_rows": len(entries),
+    return {"valid": not errors, "errors": errors, "warnings": warnings, "manifest_rows": len(entries),
             "corpus_files": len(actual), "missing_paths": missing, "extra_paths": extra,
             "duplicate_manifest_paths": duplicates, "max_file_bytes": max_file_bytes,
             "outcome_counts": outcome_counts(report) if report else None}
@@ -274,15 +315,24 @@ def validate_final_layout(layout_root: str | Path, manifest: str | Path, *, repo
 def upload_plan(layout_root: str | Path, destination: str) -> dict:
     """Produce a credential-free command plan for the supplied ``upload.py``."""
     root = Path(layout_root)
+    code, errors, warnings = resolve_code_dir(root)
+    if errors:
+        raise ValueError("; ".join(errors))
+    if not destination.startswith("gs://") or not destination.rstrip("/").rsplit("/", 1)[-1].startswith("attempt-"):
+        raise ValueError("destination must be gs://.../attempt-N/ (the folder holding corpus/, not corpus/ itself)")
+    if not destination.endswith("/"):
+        destination += "/"
     return {
         "destination": destination,
         "credentials_required": False,
         "executed": False,
         "upload_script": "upload.py",
-        "paths": {"corpus": str(root / "corpus"), "code": str(root / "pipeline-source"),
-                  "readme": str(root / "README.txt")},
+        "paths": {"corpus": str(root / "corpus"), "code": str(code), "readme": str(root / "README.txt")},
+        "remote": {"corpus": destination + "corpus/", "code": destination + "code/",
+                   "readme": destination + "README.txt"},
+        "warnings": warnings,
         "argv": ["python3", "upload.py", "--dest", destination, "--corpus", str(root / "corpus"),
-                 "--code", str(root / "pipeline-source"), "--readme", str(root / "README.txt")],
+                 "--code", str(code), "--readme", str(root / "README.txt")],
         "note": "Plan only; supply MACHINA_UPLOAD_TOKEN explicitly when authorized.",
     }
 

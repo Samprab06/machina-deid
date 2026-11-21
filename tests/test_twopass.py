@@ -419,3 +419,44 @@ def test_failed_pdf_validation_reports_no_verified_changes(tmp_path, cat):
     assert outcome.status == "failed" and not dst.exists()
     assert outcome.independent_residual["embedded_files"] > 0
     assert not any(outcome.replacement_counts().values())
+
+
+def _catalog_tables(db):
+    con = sqlite3.connect(db)
+    try:
+        names = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+        # rowid order (not sorted) so the decision log's sequence is compared too.
+        return {n: list(con.execute(f"SELECT * FROM {n} ORDER BY rowid")) for n in names
+                if n not in ("meta", "sqlite_sequence")}
+    finally:
+        con.close()
+
+
+def test_parallel_discovery_matches_serial_catalog_exactly(tmp_path, corpus):
+    dbs, results = {}, {}
+    for workers in (1, 3):
+        dbs[workers] = tmp_path / f"cat{workers}" / "cat.sqlite"
+        with IdentityCatalog(dbs[workers], SECRET) as c:
+            results[workers] = tp.discover_batch(c, items(corpus), limit=10, workers=workers).to_dict()
+    assert results[1] == results[3] and results[1]["files"] == 4
+    serial, parallel = _catalog_tables(dbs[1]), _catalog_tables(dbs[3])
+    assert serial["observations"] and serial["decisions"]
+    assert serial == parallel
+
+
+def test_parallel_discovery_is_idempotent_and_validates_workers(corpus, cat):
+    first = tp.discover_batch(cat, items(corpus), limit=10, workers=2)
+    again = tp.discover_batch(cat, items(corpus), limit=10, workers=2)
+    assert first.new_observations > 0 and again.new_observations == 0
+    with pytest.raises(ValueError):
+        tp.discover_batch(cat, items(corpus), limit=10, workers=0)
+
+
+def test_cli_discover_workers(tmp_path, corpus, capsys):
+    secret = tmp_path / "secret"
+    secret.write_bytes(SECRET)
+    rc = cli.main(["catalog", "discover", *map(str, sorted(corpus.iterdir())), "--catalog",
+                   str(tmp_path / "c.sqlite"), "--secret-file", str(secret), "--source-root", str(corpus),
+                   "--workers", "2"])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["files"] == 4
