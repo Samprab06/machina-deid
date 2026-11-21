@@ -186,3 +186,25 @@ def test_bad_zip_and_encrypted(tmp_path):
         raw[off] |= 1
     res = transform_zip(write(tmp_path, bytes(raw), "e.zip"), tmp_path / "o2.zip")
     assert res.reason == "encrypted_member"
+
+
+def test_zip_svg_and_stl_metadata_rewrite_preserves_geometry(tmp_path):
+    from zipfile import ZipFile
+
+    from machina_deid.archive import transform_zip
+    from machina_deid.idmap import IdentityMap
+
+    svg = (b'<svg xmlns="http://www.w3.org/2000/svg" xmlns:dc="http://purl.org/dc/elements/1.1/">'
+           b'<metadata><dc:creator>Jane Doe</dc:creator></metadata><path d="M0 0 L5 5"/></svg>')
+    facets = b"facet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\n"
+    stl = b"solid Jane Doe\n" + facets + b"endsolid Jane Doe\n"
+    source = tmp_path / "input.zip"
+    output = tmp_path / "output.zip"
+    with ZipFile(source, "w") as z:
+        z.writestr("design.svg", svg)
+        z.writestr("mesh.stl", stl)
+    result = transform_zip(source, output, IdentityMap(strings={"Jane Doe": "Person 123"}))
+    assert result.ok
+    with ZipFile(output) as z:
+        assert z.read("design.svg") == svg.replace(b"Jane Doe", b"Person 123")
+        assert z.read("mesh.stl") == b"solid Person 123\n" + facets + b"endsolid Person 123\n"

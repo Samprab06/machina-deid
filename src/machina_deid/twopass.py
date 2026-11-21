@@ -450,13 +450,13 @@ def step_literal_residual(path: Path, values) -> int:
     return n
 
 
-def _independent_pdf_check(src: Path, dst: Path, values: list[str], out) -> bool:
+def _independent_pdf_check(src: Path, dst: Path, values: list[str], out, *, scoped: bool = False) -> bool:
     """Rescan the written PDF with the independent inspector; on any residual approved value, missing
     coverage, or page geometry change, remove the output and fail. Records redacted counts only."""
     from .pdf_residual import inspect_pdf
-    rep = inspect_pdf(dst, values)
+    rep = inspect_pdf(dst, values, word_boundaries=True) if scoped else inspect_pdf(dst, values)
     before = inspect_pdf(src, [])
-    out.independent_residual = {k: v for k, v in rep.residual.items() if v}
+    out.independent_residual.update({k: v for k, v in rep.residual.items() if v})
     out.residual_approved += rep.total
     reason = ("independent_inspection_incomplete" if not rep.ok or not before.ok
               else "independent_geometry_mismatch" if (rep.pages, rep.dimensions) != (before.pages, before.dimensions)
@@ -633,7 +633,7 @@ def _transform_pdf_scoped(scope, cat, src: Path, dst: Path, idmap: IdentityMap, 
     out.residual_approved = sum(r.residual.values()) + unresolved
     if unresolved:
         out.independent_residual["pdf_unresolved_findings"] = unresolved
-    if not _independent_pdf_check(src, dst, sorted(set(r.resolved_values) | set(idmap.strings)), out):
+    if not _independent_pdf_check(src, dst, sorted(set(r.resolved_values) | set(idmap.strings)), out, scoped=True):
         out.reason = "pdf_scoped:" + out.reason
         return "failed"
     return "ok"

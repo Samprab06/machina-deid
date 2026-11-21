@@ -45,7 +45,9 @@ def is_metadata_sidecar(name: str) -> bool:
     return bool(parts) and ("__MACOSX" in parts[:-1] or parts[0] == "__MACOSX" or parts[-1].startswith("._"))
 
 
-SUPPORTED = {".pdf": "pdf", ".dxf": "dxf", ".step": "step", ".stp": "step"}
+SUPPORTED = {
+    ".pdf": "pdf", ".dxf": "dxf", ".step": "step", ".stp": "step", ".svg": "svg", ".stl": "stl",
+}
 NESTED = {".zip"}
 
 MEMBER_OUTCOMES = ("directory_preserved", "unsupported_passthrough", "inspected_no_map",
@@ -296,6 +298,25 @@ def _transform_member(kind: str, data: bytes, idmap: IdentityMap, work: Path, re
             rep.outcome, rep.reason = "identifiers_unmodifiable", "pdf_validation_failed"
             rep.residual = dict(r.residual) or _scan(data, idmap)
             return data
+        if kind in ("svg", "stl"):
+            if kind == "svg":
+                from .svg_meta import transform_svg
+                r = transform_svg(src, dst, idmap.strings)
+                counter = "svg_metadata_replacements"
+            else:
+                from .stl_meta import transform_stl
+                r = transform_stl(src, dst, idmap.strings.get)
+                counter = "mesh_header_replacements"
+            if r.outcome == "transformed_validated":
+                out = dst.read_bytes()
+                rep.outcome = r.outcome
+                setattr(rep.changes, counter, r.replacements)
+                rep.residual = _scan(out, idmap)
+                return out
+            rep.outcome = "inspected_no_identifiers" if r.outcome == "inspected_no_identifiers" else "identifiers_unmodifiable"
+            rep.reason = r.reason
+            rep.residual = _scan(data, idmap)
+            return data
         if kind == "dxf":
             from .dxf_transform import transform_dxf
             r = transform_dxf(src, dst, idmap)
@@ -371,7 +392,7 @@ def _scope_member(scope, kind: str | None, data: bytes, idmap: IdentityMap | Non
         base.write_bytes(data)
         try:
             vals = sorted(set(res.resolved_values) | set(idmap.strings if idmap is not None else {}))
-            ind, b0 = inspect_pdf(tmp, vals), inspect_pdf(base, [])
+            ind, b0 = inspect_pdf(tmp, vals, word_boundaries=True), inspect_pdf(base, [])
         finally:
             tmp.unlink(missing_ok=True)
             base.unlink(missing_ok=True)
