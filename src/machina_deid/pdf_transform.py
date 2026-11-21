@@ -172,7 +172,7 @@ def transform_pdf(src: str | Path, dst: str | Path, idmap: IdentityMap, *, clear
 
         dst.parent.mkdir(parents=True, exist_ok=True)
         tmp = dst.with_name(dst.name + ".partial")
-        doc.save(tmp, garbage=4, deflate=True, clean=True)
+        doc.save(tmp, garbage=4, deflate=True, clean=True, no_new_id=True)  # reproducible output bytes
     finally:
         doc.close()
 

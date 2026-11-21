@@ -52,7 +52,6 @@ class Edit:
     fitted: bool = False
     fontsize: float = 0.0
     status: str = "planned"  # planned | verified | failed:<reason>
-    rotation: int = 0  # OCR edits: orientation the page image was read in (re-OCR verification)
 
 
 @dataclass
@@ -76,6 +75,8 @@ class ScopedResult:
     links_restored: int = 0
     textless_pages: int = 0
     ocr: Counter = field(default_factory=Counter)  # OCR guard/outcome codes
+    ocr_pages: int = 0
+    ocr_edits_verified: int = 0
     trace: list[dict] = field(default_factory=list)  # value-free per-edit records (page, rect, kind, status)
     resolved_values: list[str] = field(default_factory=list, repr=False)  # raw, memory only
 
@@ -138,21 +139,11 @@ def _lookup_in_context(value: str, container: str, resolver: Resolver):
     return match
 
 
-def plan_page(page, resolver: Resolver, res: ScopedResult, ocr_lines=None, *, min_conf: float = 70.0) -> list[Edit]:
-    """Findings -> resolved, non-overlapping edits. ``ocr_lines`` (textless pages) replace extracted text;
-    an OCR finding counts only if every character of its span was read at ``min_conf`` or better."""
+def plan_page(page, resolver: Resolver, res: ScopedResult, ocr_lines=None) -> list[Edit]:
+    """Resolve and plan non-overlapping edits from native text or OCR lines."""
     is_ocr = ocr_lines is not None
     lines = ocr_lines if is_ocr else page_lines(page)
     found: list[Finding] = scan_page_lines(lines)
-    if is_ocr:
-        kept = []
-        for f in found:
-            confs = getattr(f.line, "confs", None) or [0.0]
-            if min(confs[f.start:f.end] or [0.0]) >= min_conf:
-                kept.append(f)
-            else:
-                res.ocr["finding_low_confidence"] += 1
-        found = kept
     for f in found:
         res.findings[f"{'ocr:' if is_ocr else ''}{f.source}:{f.kind}"] += 1
     edits: list[Edit] = []
@@ -168,8 +159,7 @@ def plan_page(page, resolver: Resolver, res: ScopedResult, ocr_lines=None, *, mi
         new, fs, is_fit = _choose_text(entry.pseudonym, entry.fitted, _extent(ln, f.start, f.end), ln.size)
         org = ln.origins[f.start] if ln.origins else ln.origin
         edits.append(Edit(page.number, f.kind, ("ocr:" if is_ocr else "") + f.source, f.value, new, tuple(r),
-                          ln.dir, tuple(org), ln.size, ln.color, is_fit, fs,
-                          rotation=getattr(ln, "rotation", 0)))
+                          ln.dir, tuple(org), ln.size, ln.color, is_fit, fs))
 
     for f in sorted(found, key=lambda f: -(f.end - f.start)):
         entry, why = resolver.resolve(f.kind, f.value)
@@ -182,9 +172,6 @@ def plan_page(page, resolver: Resolver, res: ScopedResult, ocr_lines=None, *, mi
     # unlabelled occurrences: frozen map + values already resolved in this document (duplicates)
     for f in lookup_findings(lines, resolver.lookup):
         if not _lookup_in_context(f.value, f.line.text, resolver):
-            continue
-        if is_ocr and min((getattr(f.line, "confs", None) or [0.0])[f.start:f.end] or [0.0]) < min_conf:
-            res.ocr["finding_low_confidence"] += 1
             continue
         entry = resolver.entry(f.value)
         if entry is not None:
@@ -486,7 +473,7 @@ def _subst_document(doc, sub: _Subst, res: ScopedResult, resolver: Resolver) -> 
 
 
 def transform_pdf_scoped(src: str | Path, dst: str | Path, resolver: Resolver, *, overwrite: bool = False,
-                         render_check: bool = True, ocr=None) -> ScopedResult:
+                         render_check: bool = True, ocr: bool = False) -> ScopedResult:
     src, dst = Path(src), Path(dst)
     if src.resolve() == dst.resolve():
         raise ValueError("output path must differ from source path")
@@ -510,8 +497,12 @@ def transform_pdf_scoped(src: str | Path, dst: str | Path, resolver: Resolver, *
         for page in doc:
             if not page.get_text("text").strip():
                 res.textless_pages += 1
-                if ocr is not None:
-                    ocr_cache[page.number] = ocr_page_lines(page, ocr, res.ocr)
+                if ocr:
+                    try:
+                        ocr_cache[page.number] = ocr_page_lines(page)
+                        res.ocr_pages += 1
+                    except (RuntimeError, ValueError):
+                        res.ocr["scan_unavailable"] += 1
             edits = plan_page(page, resolver, res, ocr_cache.get(page.number))
             if any(a.type[0] == pymupdf.PDF_ANNOT_REDACT for a in (page.annots() or [])) and edits:
                 res.reason = "preexisting_redaction_annotation"
@@ -546,7 +537,7 @@ def transform_pdf_scoped(src: str | Path, dst: str | Path, resolver: Resolver, *
             for e in edits:
                 r = pymupdf.Rect(e.rect)
                 if e.source.startswith("ocr"):  # scanned/outlined glyphs: clear the word box itself
-                    page.add_redact_annot(r, fill=(1, 1, 1))
+                    page.add_redact_annot(r, fill=False)
                 else:
                     inset = min(r.width, r.height) * 0.15
                     page.add_redact_annot(r + (0.3, inset, -0.3, -inset) if r.width > 1 else r)
@@ -570,7 +561,7 @@ def transform_pdf_scoped(src: str | Path, dst: str | Path, resolver: Resolver, *
             res.reason = "no_resolved_identities"
             return res
         dst.parent.mkdir(parents=True, exist_ok=True)
-        doc.save(tmp, garbage=3, deflate=True)
+        doc.save(tmp, garbage=3, deflate=True, no_new_id=True)
     finally:
         doc.close()
 
@@ -629,7 +620,8 @@ def _verify(src, out_path, plans, keep, before, geometry, pairs, res: ScopedResu
                 inside = "".join(c for ln in lines for c, b in zip(ln.text, ln.boxes)
                                  if _inside(b, [region + (-0.5, -0.5, 0.5, 0.5)]))
                 if e.source.startswith("ocr"):
-                    why = _verify_ocr_edit(srcdoc[pno], page, e, inside, ocr)
+                    why = _verify_ocr_edit(srcdoc[pno], page, e, inside)
+                    res.ocr_edits_verified += not why
                 elif _compact(e.old) in _compact(inside):
                     why = "old_present"
                 elif e.new and _compact(e.new) not in _compact(inside):
@@ -662,7 +654,7 @@ def _verify(src, out_path, plans, keep, before, geometry, pairs, res: ScopedResu
         srcdoc.close()
 
 
-def _verify_ocr_edit(src_page, out_page, e: Edit, inside: str, engine) -> str:
+def _verify_ocr_edit(src_page, out_page, e: Edit, inside: str) -> str:
     """OCR edit: pseudonym extractable + inked, the word box pixels actually changed, and (independently)
     a fresh OCR of the box no longer reads the original value."""
     if _compact(e.new) not in _compact(inside):
@@ -677,11 +669,10 @@ def _verify_ocr_edit(src_page, out_page, e: Edit, inside: str, engine) -> str:
     b = out_page.get_pixmap(clip=clip, colorspace=pymupdf.csGRAY, alpha=False).samples
     if a == b:
         return "region_not_cleared"
-    if engine is None:
-        return "ocr_reverify_unavailable"
     from .pdf_ocr import region_text
-    txt = region_text(out_page, r, e.rotation, engine)
-    if txt is None:
+    try:
+        txt = region_text(out_page, r)
+    except (RuntimeError, ValueError):
         return "ocr_reverify_unavailable"
     if _compact(e.old) in _compact(txt):
         return "old_ocr_readable"

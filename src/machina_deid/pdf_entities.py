@@ -84,16 +84,18 @@ class _Obs:
     families: set = field(default_factory=set)
     labeled: int = 0
     display: str = ""
+    ole: str = ""  # exact value of a parsed OLE saved-account property (structured; does not vote a kind)
 
 
 class EntityMapBuilder:
     """Collect findings across documents (raw values only in memory), then ``freeze`` to disk."""
 
-    def __init__(self, secret: bytes, catalog=None):
+    def __init__(self, secret: bytes, catalog=None, *, ole_alias_key: bytes | None = None):
         if len(secret) < 16:
             raise EntityMapError("secret too short")
         self._secret = bytes(secret)
         self._catalog = catalog
+        self._ole_key = ole_alias_key
         self._obs: dict[str, _Obs] = defaultdict(_Obs)  # normalized value -> observations
         self.documents = 0
 
@@ -107,10 +109,13 @@ class EntityMapBuilder:
             if not n:
                 continue
             o = self._obs[n]
-            o.kinds[f.kind] += 1
             o.docs.add(rel)
             o.families.add(fam)
-            o.labeled += f.source.startswith("label") or f.source == "inline"
+            o.labeled += f.source.startswith(("label", "structured")) or f.source == "inline"
+            if f.source.startswith("structured:ole"):
+                o.ole = o.ole or f.value
+                continue
+            o.kinds[f.kind] += 1
             o.display = o.display or f.value
 
     # -------------------------------------------------------------- decisions
@@ -119,6 +124,9 @@ class EntityMapBuilder:
         stats: Counter = Counter()
         decided: dict[str, dict] = {}
         for n, o in self._obs.items():
+            if not o.kinds:  # seen only as an OLE saved account
+                o.kinds["account"] += 1
+                o.display = o.ole
             (kind, top), *rest = o.kinds.most_common() + [("", 0)]
             second = rest[0][1] if rest else 0
             amb = kind not in _PATTERN_KINDS and second > 0 and top < 4 * second
@@ -174,14 +182,20 @@ class EntityMapBuilder:
                 if hit is not None:
                     ps = hit[1]
                     stats["catalog_pseudonym"] += 1
+            o = d["obs"]
+            if ps is None and o.ole and self._ole_key is not None and r == n:
+                # Also saved in an OLE account field: one equal-length pseudonym shared by OLE and PDF.
+                from .ole_transform import equal_length_alias
+                ps = equal_length_alias(o.ole, self._ole_key)
+                stats["ole_equal_length_pseudonym"] += 1
             if ps is None:
                 ps = mapper.pseudonym(kind if kind in FIT_CODES else "text", r)
             if used.setdefault(ps, r) != r and d["status"] == "ok":
                 # two different roots must never share a pseudonym (catalog alias roots excepted)
                 stats["pseudonym_shared_across_roots"] += 1
-            o = d["obs"]
             lookup_ok = int(d["status"] == "ok" and _lookup_eligible(kind, o))
-            rows.append((_vkey(self._secret, n), kind, ps, fitted(ps, kind), d["status"], len(o.docs),
+            fit = ps if o.ole and len(ps) == len(o.ole) else fitted(ps, kind)
+            rows.append((_vkey(self._secret, n), kind, ps, fit, d["status"], len(o.docs),
                          int(o.labeled), lookup_ok, _vkey(self._secret, r)))
         tmp = path.with_name(path.name + ".tmp")
         tmp.unlink(missing_ok=True)

@@ -334,9 +334,68 @@ def _copy_info(info: zipfile.ZipInfo) -> zipfile.ZipInfo:
     return n
 
 
+def _scope_member(scope, kind: str | None, data: bytes, idmap: IdentityMap | None, work: Path,
+                  rep: MemberReport) -> bytes | None:
+    """Attempt 2c: PDF scoped rewrite / CFB saved account through the frozen shared map.
+
+    Returns the bytes to store, or ``None`` to continue with the legacy member path (nothing resolved)."""
+    from .ole_transform import is_cfb
+    if is_cfb(data[:8]):
+        r = scope.ole(data)
+        if r.status == "transformed":
+            rep.outcome = "transformed_validated"
+            rep.changes.ole_property_replacements = r.property_writes
+            rep.changes.ole_cross_stream_replacements = r.cross_stream_writes
+            if r.unresolved:
+                rep.residual = {-1: sum(r.unresolved.values())}
+            return r.data
+        if r.status == "failed":
+            rep.outcome, rep.reason = "identifiers_unmodifiable", r.reason[:80]
+            rep.residual = {-1: max(1, sum(r.unresolved.values()))}
+        else:
+            rep.outcome = "inspected_no_identifiers"
+        return data
+    if kind != "pdf":
+        return None
+    try:
+        res, new = scope.pdf_bytes(data, work, dict(idmap.strings) if idmap is not None else None)
+    except Exception as exc:  # noqa: BLE001
+        rep.outcome, rep.reason = "identifiers_unmodifiable", f"pdf_scoped_exception:{type(exc).__name__}"
+        rep.residual = {-1: 1}
+        return data
+    if res.ok and new is not None:
+        from .pdf_residual import inspect_pdf
+        tmp = work / f"{uuid.uuid4().hex}.chk.pdf"
+        base = work / f"{uuid.uuid4().hex}.base.pdf"
+        tmp.write_bytes(new)
+        base.write_bytes(data)
+        try:
+            vals = sorted(set(res.resolved_values) | set(idmap.strings if idmap is not None else {}))
+            ind, b0 = inspect_pdf(tmp, vals), inspect_pdf(base, [])
+        finally:
+            tmp.unlink(missing_ok=True)
+            base.unlink(missing_ok=True)
+        if ind.ok and b0.ok and not ind.total and (ind.pages, ind.dimensions) == (b0.pages, b0.dimensions):
+            rep.outcome = "transformed_validated"
+            from .twopass import _pdf_counts
+            rep.changes = _pdf_counts(res)
+            left = sum(res.unresolved.values()) + sum(res.residual.values())
+            if left:
+                rep.residual = {-1: left}
+            return new
+        rep.outcome, rep.reason = "identifiers_unmodifiable", "pdf_scoped:independent_check_failed"
+        rep.residual = {-1: max(1, ind.total)}
+        return data
+    if res.reason == "no_resolved_identities":
+        return None
+    rep.outcome, rep.reason = "identifiers_unmodifiable", f"pdf_scoped:{res.reason}"[:80]
+    rep.residual = {-1: max(1, sum(res.unresolved.values()))}
+    return data
+
+
 class _Ctx:
-    def __init__(self, idmap: IdentityMap | None, limits: ArchiveLimits, work: Path):
-        self.idmap, self.limits, self.work = idmap, limits, work
+    def __init__(self, idmap: IdentityMap | None, limits: ArchiveLimits, work: Path, scope=None):
+        self.idmap, self.limits, self.work, self.scope = idmap, limits, work, scope
         self.budget = _Budget(limits)
         self.next_index = 0
         self.flat: list[MemberReport] = []
@@ -372,6 +431,9 @@ def _rebuild(zin: zipfile.ZipFile, zout: zipfile.ZipFile, depth: int, ctx: _Ctx,
                 rep.residual = _scan(data, ctx.idmap)
         elif rep.ext in NESTED:
             new = _nested(data, depth + 1, ctx, rep)
+        elif ctx.scope is not None and (got := _scope_member(ctx.scope, kind, data, ctx.idmap, ctx.work,
+                                                            rep)) is not None:
+            new = got
         elif kind is None:
             rep.outcome = "unsupported_passthrough"
             if ctx.idmap is not None:
@@ -443,7 +505,7 @@ def _sha_file(p: Path) -> str:
 
 
 def transform_zip(src: str | Path, dst: str | Path, idmap: IdentityMap | None = None, *,
-                  limits: ArchiveLimits = ArchiveLimits(), overwrite: bool = False) -> ArchiveResult:
+                  limits: ArchiveLimits = ArchiveLimits(), overwrite: bool = False, scope=None) -> ArchiveResult:
     """Rebuild ``src`` into ``dst``; see module docstring. ``dst`` exists only if ``ok``."""
     src, dst = Path(src), Path(dst)
     if src.resolve() == dst.resolve():
@@ -456,7 +518,7 @@ def transform_zip(src: str | Path, dst: str | Path, idmap: IdentityMap | None = 
     tmp = dst.with_name(f".{dst.name}.{uuid.uuid4().hex[:10]}.partial")
     try:
         with tempfile.TemporaryDirectory(prefix="deid-zip-") as work:
-            ctx = _Ctx(idmap, limits, Path(work))
+            ctx = _Ctx(idmap, limits, Path(work), scope)
             try:
                 with zipfile.ZipFile(src) as zin:
                     # validate the whole tree up-front (nested names/limits) before decompressing
