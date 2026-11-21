@@ -1,0 +1,42 @@
+{
+  "note": "Attempt 3 independent RCAC fixture truth. All identities, names, and technical values are entirely fictional and invented for this fixture only.",
+  "identities": {
+    "P1": "Wendy W. Whittaker",
+    "P2": "Mort S. Mendez",
+    "O1": "Northgate Fabrication",
+    "E1": "wendy.whittaker@northgate-fab.example"
+  },
+  "confusable": {
+    "C1": {
+      "value": "Wendy Whittaker-Smith",
+      "relation": "unrelated person with a similar surname",
+      "expect": "preserved_verbatim"
+    }
+  },
+  "documents": [
+    "famA/drw-001.pdf",
+    "famA/drw-002.pdf"
+  ],
+  "occurrences": [
+    {"doc": "famA/drw-001.pdf", "value": "Wendy W. Whittaker", "kind": "person", "entity": "P1", "where": "titleblock_drawn"},
+    {"doc": "famA/drw-001.pdf", "value": "Wendy W. Whittaker", "kind": "person", "entity": "P1", "where": "inline_prepared_by"},
+    {"doc": "famA/drw-001.pdf", "value": "Mort S. Mendez", "kind": "person", "entity": "P2", "where": "titleblock_checked"},
+    {"doc": "famA/drw-001.pdf", "value": "Northgate Fabrication", "kind": "org", "entity": "O1", "where": "titleblock_company"},
+    {"doc": "famA/drw-002.pdf", "value": "Wendy W. Whittaker", "kind": "person", "entity": "P1", "where": "notes_line"},
+    {"doc": "famA/drw-002.pdf", "value": "Wendy W. Whittaker", "kind": "person", "entity": "P1", "where": "annot_title"},
+    {"doc": "famA/drw-002.pdf", "value": "Wendy W. Whittaker", "kind": "person", "entity": "P1", "where": "metadata_author"},
+    {"doc": "famA/drw-002.pdf", "value": "wendy.whittaker@northgate-fab.example", "kind": "email", "entity": "E1", "where": "inline"}
+  ],
+  "must_be_absent": [
+    "Wendy W. Whittaker",
+    "Mort S. Mendez",
+    "Northgate Fabrication",
+    "wendy.whittaker@northgate-fab.example"
+  ],
+  "must_be_preserved": {
+    "Wendy Whittaker-Smith": ["famA/drw-001.pdf"],
+    "DWG 77-042": ["famA/drw-001.pdf", "famA/drw-002.pdf"],
+    "SCALE 1:2": ["famA/drw-001.pdf", "famA/drw-002.pdf"],
+    "Ø120 ±0.05": ["famA/drw-001.pdf"]
+  }
+}
