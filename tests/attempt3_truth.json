@@ -15,8 +15,23 @@
   },
   "documents": [
     "famA/drw-001.pdf",
-    "famA/drw-002.pdf"
+    "famA/drw-002.pdf",
+    "famB/sheet-3.pdf",
+    "cad/part1.sldprt",
+    "cad/part2.sldprt",
+    "bundle/pack.zip:drw/drw-002.pdf",
+    "bundle/pack.zip:cad/asm.sldasm"
   ],
+  "ole": {
+    "A1": "jqdoe7",
+    "expect": "one shared equal-length account alias across part1, part2 and the zip member; no other OLE surface changed"
+  },
+  "archive": {
+    "expect": "zip member drw/drw-002.pdf carries the same identity replacements as the top-level doc; unrelated member bytes unchanged"
+  },
+  "rotation": {
+    "expect": "identity text on a 90-degree-rotated page is removed like on upright pages; confusable + technical text on that page survives"
+  },
   "occurrences": [
     {"doc": "famA/drw-001.pdf", "value": "Wendy W. Whittaker", "kind": "person", "entity": "P1", "where": "titleblock_drawn"},
     {"doc": "famA/drw-001.pdf", "value": "Wendy W. Whittaker", "kind": "person", "entity": "P1", "where": "inline_prepared_by"},
@@ -25,7 +40,14 @@
     {"doc": "famA/drw-002.pdf", "value": "Wendy W. Whittaker", "kind": "person", "entity": "P1", "where": "notes_line"},
     {"doc": "famA/drw-002.pdf", "value": "Wendy W. Whittaker", "kind": "person", "entity": "P1", "where": "annot_title"},
     {"doc": "famA/drw-002.pdf", "value": "Wendy W. Whittaker", "kind": "person", "entity": "P1", "where": "metadata_author"},
-    {"doc": "famA/drw-002.pdf", "value": "wendy.whittaker@northgate-fab.example", "kind": "email", "entity": "E1", "where": "inline"}
+    {"doc": "famA/drw-002.pdf", "value": "wendy.whittaker@northgate-fab.example", "kind": "email", "entity": "E1", "where": "inline_doc2"},
+    {"doc": "famB/sheet-3.pdf", "value": "Wendy W. Whittaker", "kind": "person", "entity": "P1", "where": "rotated_page_inline"},
+    {"doc": "famB/sheet-3.pdf", "value": "Wendy Whittaker-Smith", "kind": "confusable", "entity": "C1", "where": "rotated_page_note"},
+    {"doc": "famB/sheet-3.pdf", "value": "DWG 77-042", "kind": "keep", "entity": null, "where": "rotated_page_title"},
+    {"doc": "cad/part1.sldprt", "value": "jqdoe7", "kind": "ole_account", "entity": "A1", "where": "lastauthor+Contents"},
+    {"doc": "cad/part2.sldprt", "value": "jqdoe7", "kind": "ole_account", "entity": "A1", "where": "lastauthor+Contents"},
+    {"doc": "bundle/pack.zip:drw/drw-002.pdf", "value": "Wendy W. Whittaker", "kind": "person", "entity": "P1", "where": "zip_member_copy_of_doc2"},
+    {"doc": "bundle/pack.zip:cad/asm.sldasm", "value": "jqdoe7", "kind": "ole_account", "entity": "A1", "where": "zip_member_ole"}
   ],
   "must_be_absent": [
     "Wendy W. Whittaker",
