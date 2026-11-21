@@ -328,6 +328,9 @@ def _shifted_runs(page, keep: list) -> list[tuple[float, float, float]]:
     return out
 
 
+MAX_REFLOW_TRIALS = 60
+
+
 def _lost_chars(keep: list, chars: list, tol: float = 0.6) -> int:
     """Kept glyphs with no same-character glyph within ``tol`` pt on every box edge (greedy, one-to-one)."""
     exact = Counter(keep) - Counter((c, _rkey(b)) for c, b in chars)
@@ -355,7 +358,7 @@ def _fix_redaction_shift(doc, page, keep: list, edits) -> int:
     """MuPDF 2.x compensates a glyph run removed from the middle of a TJ/Tj by one glyph advance too little, so
     text after an embedded edit slides left. Correct the new TJ displacement per shifted run, accepted only
     when re-extraction shows fewer displaced glyphs (independent verification still follows)."""
-    fixed = 0
+    fixed = trials = 0
     for _ in range(len(edits) + 1):
         runs = _shifted_runs(page, keep)
         if not runs:
@@ -374,6 +377,9 @@ def _fix_redaction_shift(doc, page, keep: list, edits) -> int:
                     disp = -val / 1000 * size
                     if not any(0.4 * w <= disp <= 1.6 * w for w in widths):
                         continue
+                    trials += 1
+                    if trials > MAX_REFLOW_TRIALS:
+                        return fixed  # bounded cost; unresolved shift fails verification (page skipped)
                     a, b = m.start(1) + n.start(1), m.start(1) + n.end(1)
 
                     def put(d):
@@ -406,7 +412,9 @@ def _fix_redaction_shift(doc, page, keep: list, edits) -> int:
 # ------------------------------------------------------------------ string substitution (non-page text)
 
 
-_B0, _B1 = r"(?<![^\W_])", r"(?![^\W_])"  # boundary = not a letter/digit (underscore separates, as in paths)
+# boundary = not a letter/digit (underscore separates, as in paths); a hyphen joined to a letter/digit
+# continues the token ("Duarte-Lopes" is a different name than "Duarte")
+_B0, _B1 = r"(?<![^\W_])(?<![^\W_]-)", r"(?![^\W_]|-[^\W_])"
 
 
 class _Subst:

@@ -131,3 +131,29 @@ def test_synthetic_end_to_end_targets(tmp_path):
     assert res["pdf_pairs_consistent"] == res["pdf_pairs"]
     assert res["triplets_ok"] == res["triplets"]
     assert res["ole_removed"] == res["ole_values"]
+
+
+def test_same_identity_twice_with_hyphenated_confusable_is_clean(tmp_path):
+    """RCAC Stage-0 shape (own values): DRAWN cell + inline PREPARED BY of one identity, a different
+    hyphenated name on the same line, metadata author; Attempt 2 failed closed (resolved_value_residual)."""
+    from machina_deid import twopass
+    d = pymupdf.open()
+    p = d.new_page()
+    p.insert_text((40, 60), "DRAWN", fontsize=8)
+    p.insert_text((80, 60), "Ana Duarte", fontsize=8)
+    p.insert_text((40, 80), "PREPARED BY Ana Duarte with notes from Ana Duarte-Lopes", fontsize=8)
+    p.insert_text((40, 100), "DWG 77-042   SCALE 1:2   Ø120 ±0.05", fontsize=8)
+    d.set_metadata({"author": "Ana Duarte"})
+    scope, items = _scope(tmp_path, {"f/doc1.pdf": d.tobytes()})
+
+    class Cat:
+        def approved_pseudonym(self, v):
+            return None
+    r = twopass.transform_file(Cat(), items[0][0], tmp_path / "o.pdf", "f/doc1.pdf", overwrite=True, scope=scope)
+    assert r.status == "transformed" and r.fully_clean, (r.reason, r.independent_residual)
+    o = pymupdf.open(tmp_path / "o.pdf")
+    t = o[0].get_text()
+    assert "Ana Duarte-Lopes" in t and t.count("Ana Duarte") == 1
+    assert "DWG 77-042   SCALE 1:2   Ø120 ±0.05" in t
+    ps = o.metadata["author"]
+    assert ps != "Ana Duarte" and t.count(ps) == 2

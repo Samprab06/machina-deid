@@ -74,7 +74,7 @@ class _Matcher:
     def __init__(self, values: list[str], *, word_boundaries: bool = False):
         self.values = [(i, v.casefold(), _WS.sub("", v.casefold())) for i, v in enumerate(values) if v.strip()]
         self.patterns = [
-            (i, re.compile(r"(?<!\w)" + r"\s+".join(map(re.escape, v.split())) + r"(?!\w)"))
+            (i, re.compile(r"(?<!\w)(?<!\w-)" + r"\s+".join(map(re.escape, v.split())) + r"(?!\w|-\w)"))
             for i, v, _ in self.values
         ] if word_boundaries else []
 
