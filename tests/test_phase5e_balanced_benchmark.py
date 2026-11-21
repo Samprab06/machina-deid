@@ -156,8 +156,15 @@ def test_fetch_rejects_md5_mismatch(tmp_path):
 def test_redaction_guard_fails_closed():
     sel = {"files": [_row("sources/github/o/r/secret-name.step")], "reuse_roots": []}
     with pytest.raises(SystemExit, match="leak"):
-        bm.assert_redacted({"x": "secret-name.step"}, sel, {})
+        bm.assert_redacted({"x": "sources/github/o/r/secret-name.step"}, sel, {})
     bm.assert_redacted({"x": 1}, sel, {})
+
+
+def test_redaction_guard_allows_opaque_id_equal_to_basename():
+    sel = {"files": [_row("sources/github/o/r/step-large-150.step")], "reuse_roots": []}
+    # The public report uses an opaque selection ID; equality with a source basename
+    # must not be treated as a leak when the full source path is absent.
+    bm.assert_redacted({"per_file": [{"id": "step-large-150.step"}]}, sel, {})
 
 
 def test_safe_rel_allows_unicode_but_not_traversal():

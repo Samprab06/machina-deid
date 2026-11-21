@@ -519,9 +519,6 @@ def assert_redacted(report: dict, sel: dict, checks: dict) -> None:
     for r in sel["files"]:
         needles.add(r["manifest_path"])
         needles.add(r["url_path"])
-        name = Path(r["manifest_path"]).name
-        if len(name) >= 6:
-            needles.add(name)
     for c in checks.values():
         needles.add(c["path"])
     leaked = [n for n in needles if n and n in text]
