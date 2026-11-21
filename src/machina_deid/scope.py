@@ -30,7 +30,7 @@ from . import ole_transform as ot
 
 MAP_NAME = "entity-map.sqlite"
 OLE_SOURCE = "structured:ole_lastauthor"
-OLE_PIDS = (ot.PID_LASTAUTHOR,)
+OLE_PIDS = (ot.PID_AUTHOR, ot.PID_LASTAUTHOR)  # attempt 3: both saved-account slots
 _ALIAS_LABEL = b"machina-deid/ole-equal-length-alias"
 
 

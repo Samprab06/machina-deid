@@ -38,7 +38,7 @@ PID_CODEPAGE, PID_AUTHOR, PID_LASTAUTHOR = 1, 4, 8
 VT_I2, VT_LPSTR, VT_LPWSTR = 0x02, 0x1E, 0x1F
 SEPS = frozenset("\\/@.")
 SKIP_STREAM_HINTS = ("preview", "thumbnail")  # never written; only reported
-VERIFIED_KINDS = ("property", "cstring", "path_component")
+VERIFIED_KINDS = ("property", "cstring", "path_component", "lp_utf16", "lp_ansi")
 MIN_PATH_UNITS = 3  # shorter accounts are too ambiguous as bare path/contact tokens (CStrings stay exact)
 
 
@@ -366,6 +366,27 @@ def _cstring_ok(blob: bytes, off: int, nchars: int) -> bool:
         struct.unpack_from("<I", blob, off - 4)[0] == nchars
 
 
+def _len_prefixed(blob: bytes, off: int, n: int, unit: int) -> bool:
+    """Attempt 3: a length-prefixed string record that is exactly this value: a u32 (or u16) count of
+    ``n`` or ``n + 1`` (terminator included) code units / bytes immediately before ``off``, and the record ends
+    right after the value (NUL terminator, or end of the declared count). Boundary-aware, so a value inside a
+    longer word or technical string is never matched."""
+    end = off + n * unit
+    nul = blob[end:end + unit] == b"\0" * unit
+    for w, fmt in ((4, "<I"), (2, "<H")):
+        if off < w:
+            continue
+        cnt = struct.unpack_from(fmt, blob, off - w)[0]
+        if cnt == n + 1 and nul:
+            return True
+        if cnt == n and (nul or end == len(blob) or (unit == 2 and not _printable16(blob, end))
+                         or (unit == 1 and end < len(blob) and not 0x20 <= blob[end] < 0x7F)):
+            return True
+        if unit == 2 and cnt in (2 * n, 2 * n + 2) and (nul or not _printable16(blob, end)):
+            return True  # byte-count prefix
+    return False
+
+
 def _path_component_ok(blob: bytes, off: int, nbytes: int) -> bool:
     """Whole token of a printable UTF-16LE run that contains a path/contact separator."""
     def ch(i):
@@ -410,6 +431,8 @@ def scan(cfb: Cfb, values: list[str], props: list[Prop] | None = None) -> list[H
                     continue
                 if _cstring_ok(blob, i, len(u) // 2):  # MFC length counts UTF-16 code units
                     kind = "cstring"
+                elif _len_prefixed(blob, i, len(u) // 2, 2):
+                    kind = "lp_utf16"
                 elif len(u) // 2 >= MIN_PATH_UNITS and _path_component_ok(blob, i, len(u)):
                     kind = "path_component"
                 else:
@@ -425,7 +448,10 @@ def scan(cfb: Cfb, values: list[str], props: list[Prop] | None = None) -> list[H
             if a and a != u:
                 for i in _find_all(blob, a):
                     if (e.path, i) not in taken:
-                        hits.append(Hit(e.path, "raw_ascii", i, len(a), v, "cp1252"))
+                        kind = "lp_ansi" if _len_prefixed(blob, i, len(a), 1) else "raw_ascii"
+                        if kind != "raw_ascii" and any(h in e.path.lower() for h in SKIP_STREAM_HINTS):
+                            kind = "raw_ascii"
+                        hits.append(Hit(e.path, kind, i, len(a), v, "cp1252"))
                         taken.add((e.path, i))
     return hits
 

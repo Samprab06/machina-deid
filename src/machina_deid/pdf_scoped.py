@@ -77,6 +77,12 @@ class ScopedResult:
     ocr: Counter = field(default_factory=Counter)  # OCR guard/outcome codes
     ocr_pages: int = 0
     ocr_edits_verified: int = 0
+    bad_pages: set = field(default_factory=set)  # pages failing a page-level check (attempt 3 retry)
+    planned_pages: list = field(default_factory=list)
+    metadata_planned: bool = False
+    skipped_pages: int = 0
+    reflow_fixed: int = 0  # MuPDF post-redaction TJ displacement corrections (verified by re-extraction)
+    partial: bool = False  # output kept with residual of resolved values (never fully clean)
     trace: list[dict] = field(default_factory=list)  # value-free per-edit records (page, rect, kind, status)
     resolved_values: list[str] = field(default_factory=list, repr=False)  # raw, memory only
 
@@ -89,6 +95,7 @@ class ScopedResult:
     def to_dict(self) -> dict:
         d = {k: (dict(v) if isinstance(v, Counter) else v) for k, v in self.__dict__.items()}
         d.pop("resolved_values")
+        d["bad_pages"] = sorted(self.bad_pages)
         d["changes"] = self.changes
         return d
 
@@ -108,8 +115,15 @@ def _extent(line: Line, a: int, b: int) -> float:
     return max(us) - min(us)
 
 
+CANONICAL_ONLY = True  # Attempt 3: one surface form per identity across every PDF (cross-document consistency)
+MIN_CANONICAL_SCALE = 0.35
+
+
 def _choose_text(new: str, fit: str, avail: float, size: float) -> tuple[str, float, bool]:
     size = size if size > 0 else 8.0
+    if CANONICAL_ONLY:
+        w1 = pymupdf.get_text_length(new, fontname=FONT, fontsize=1.0) or 1.0
+        return new, max(size * MIN_CANONICAL_SCALE, min(size, avail / w1)), False
     for text, is_fit in ((new, False), (fit, True)):
         w1 = pymupdf.get_text_length(text, fontname=FONT, fontsize=1.0) or 1.0
         fs = min(size, avail / w1)
@@ -123,6 +137,10 @@ _CONTEXTUAL_KINDS = frozenset({"person", "org", "project", "account", "address"}
 _PERSON_CUE = re.compile(r"\b(?:attention|questions to|contact|reviewed by|prepared by|approved by)\s*[:=]?\s*$")
 
 
+def _single_initials(candidate: str) -> bool:
+    return all(len(t.strip(".")) <= 1 for t in candidate.split())
+
+
 def _lookup_in_context(value: str, container: str, resolver: Resolver):
     """Use context-free lookup only for structured identifiers."""
     match = resolver.lookup(value)
@@ -132,6 +150,10 @@ def _lookup_in_context(value: str, container: str, resolver: Resolver):
         if len(candidate.split()) < 2:
             return None
         if text != candidate:
+            # Attempt 3: a multi-token person/org identity that was role-labelled somewhere in the corpus is
+            # replaced where it is embedded in running text (n-gram spans are token-delimited).
+            if match[0] in ("person", "org") and len(candidate) >= 6 and not _single_initials(candidate):
+                return match
             if match[0] != "person" or not text.endswith(candidate):
                 return None
             if not _PERSON_CUE.search(text[:-len(candidate)]):
@@ -270,6 +292,115 @@ def _geometry(doc) -> list:
 
 def _compact(s: str) -> str:
     return re.sub(r"\s+", "", _normalize(s))
+
+
+# ------------------------------------------------------------------ MuPDF redaction re-flow correction
+
+_TJ_ARRAY = re.compile(rb"\[((?:[^\]\\]|\\.)*)\]\s*TJ", re.S)
+_TJ_NUM = re.compile(rb"(?<=[)>\s\]\[])(-?\d+(?:\.\d+)?)(?=\s*[(<])")
+
+
+def _shifted_runs(page, keep: list) -> list[tuple[float, float, float]]:
+    """(y, x_orig, dx) per line whose surviving glyphs moved horizontally by one uniform dx after redaction."""
+    if not _mismatch(page, keep):
+        return []
+    want = Counter(keep)
+    have = Counter((c, _rkey(b)) for c, b in _chars(page))
+    missing = [k for k in want - have]
+    if not missing:
+        return []
+    extra = list(have - want)
+    out = []
+    by_row: dict[tuple, list] = {}
+    for c, b in missing:
+        by_row.setdefault((round(b[1] * 2), round(b[3] * 2)), []).append((c, b))
+    for row, chs in by_row.items():
+        cands = [(c, b) for c, b in extra if (round(b[1] * 2), round(b[3] * 2)) == row]
+        diffs = []
+        for c, b in chs:
+            near = [b[0] - b2[0] for c2, b2 in cands if c2 == c and b[0] - b2[0] > 0]
+            if near:
+                diffs.append(min(near))
+        if diffs and len(diffs) >= len(chs) * 0.8:
+            dx = sorted(diffs)[len(diffs) // 2]
+            if dx > 0.25 and sum(abs(d - dx) <= 1.0 for d in diffs) >= len(chs) * 0.8:
+                out.append(((row[0] + row[1]) / 4, min(b[0] for _, b in chs), dx))
+    return out
+
+
+def _lost_chars(keep: list, chars: list, tol: float = 0.6) -> int:
+    """Kept glyphs with no same-character glyph within ``tol`` pt on every box edge (greedy, one-to-one)."""
+    exact = Counter(keep) - Counter((c, _rkey(b)) for c, b in chars)
+    if not exact:
+        return 0
+    pool: dict[str, list] = {}
+    for c, b in (Counter((c, _rkey(b)) for c, b in chars) - Counter(keep)).elements():
+        pool.setdefault(c, []).append(b)
+    lost = 0
+    for c, b in exact.elements():
+        cands = pool.get(c, [])
+        j = next((i for i, q in enumerate(cands) if all(abs(x - y) <= tol for x, y in zip(b, q))), None)
+        if j is None:
+            lost += 1
+        else:
+            cands.pop(j)
+    return lost
+
+
+def _mismatch(page, keep: list) -> int:
+    return _lost_chars(keep, _chars(page))
+
+
+def _fix_redaction_shift(doc, page, keep: list, edits) -> int:
+    """MuPDF 2.x compensates a glyph run removed from the middle of a TJ/Tj by one glyph advance too little, so
+    text after an embedded edit slides left. Correct the new TJ displacement per shifted run, accepted only
+    when re-extraction shows fewer displaced glyphs (independent verification still follows)."""
+    fixed = 0
+    for _ in range(len(edits) + 1):
+        runs = _shifted_runs(page, keep)
+        if not runs:
+            break
+        y, x0, dx = runs[0]
+        row = [e for e in edits if e.rect[1] - 2 <= y <= e.rect[3] + 2] or list(edits)
+        size = row[0].size or 8.0
+        widths = [e.rect[2] - e.rect[0] for e in row]
+        base = _mismatch(page, keep)
+        progress = False
+        for xref in page.get_contents():
+            data = doc.xref_stream(xref) or b""
+            for m in _TJ_ARRAY.finditer(data):
+                for n in _TJ_NUM.finditer(m.group(1)):
+                    val = float(n.group(1))
+                    disp = -val / 1000 * size
+                    if not any(0.4 * w <= disp <= 1.6 * w for w in widths):
+                        continue
+                    a, b = m.start(1) + n.start(1), m.start(1) + n.end(1)
+
+                    def put(d):
+                        doc.update_stream(xref, data[:a] + f"{val - d * 1000 / size:.4f}".encode() + data[b:])
+                        return _mismatch(page, keep)
+                    got = put(dx)
+                    if got < base:
+                        best = (got, dx)
+                        for k in range(1, 13):  # refine: boxes were compared on a 0.5pt grid
+                            for d in (dx - 0.1 * k, dx + 0.1 * k):
+                                if best[0] == 0:
+                                    break
+                                g = put(d)
+                                if g < best[0]:
+                                    best = (g, d)
+                        put(best[1])
+                        fixed += 1
+                        progress = True
+                        break
+                    doc.update_stream(xref, data)
+                if progress:
+                    break
+            if progress:
+                break
+        if not progress:
+            break
+    return fixed
 
 
 # ------------------------------------------------------------------ string substitution (non-page text)
@@ -472,8 +603,37 @@ def _subst_document(doc, sub: _Subst, res: ScopedResult, resolver: Resolver) -> 
 # ------------------------------------------------------------------ main entry
 
 
+_PAGE_CHECKS = frozenset(("vector_graphics_changed", "images_changed", "ocr_region_overflow",
+                          "text_outside_edit_regions_changed", "edit_verification_failed"))
+MAX_PAGE_RETRIES = 3
+
+
 def transform_pdf_scoped(src: str | Path, dst: str | Path, resolver: Resolver, *, overwrite: bool = False,
                          render_check: bool = True, ocr: bool = False) -> ScopedResult:
+    """Attempt 3: page-granular fail-closed. A page whose edits fail a preservation/edit check is excluded
+    (its occurrences stay and are counted as residual) and the document is re-planned, so one bad
+    occurrence never discards the verified edits of other pages. A residual-only verdict keeps the
+    verified output with ``partial=True`` (never fully clean)."""
+    skip: set[int] = set()
+    res = first = None
+    for _ in range(MAX_PAGE_RETRIES + 1):
+        res = _transform_once(src, dst, resolver, overwrite=overwrite, render_check=render_check, ocr=ocr,
+                              skip_pages=frozenset(skip))
+        first = first or res
+        new_bad = res.bad_pages - skip
+        if res.ok or res.reason not in _PAGE_CHECKS or not new_bad:
+            break
+        skip |= new_bad
+        if not set(res.planned_pages) - skip and not res.metadata_planned:
+            break
+    if not res.ok:
+        res = first  # no verified partial output: report the original failing checks
+    res.skipped_pages = len(skip) if res is not first else 0
+    return res
+
+
+def _transform_once(src: str | Path, dst: str | Path, resolver: Resolver, *, overwrite: bool,
+                    render_check: bool, ocr: bool, skip_pages: frozenset) -> ScopedResult:
     src, dst = Path(src), Path(dst)
     if src.resolve() == dst.resolve():
         raise ValueError("output path must differ from source path")
@@ -504,6 +664,8 @@ def transform_pdf_scoped(src: str | Path, dst: str | Path, resolver: Resolver, *
                     except (RuntimeError, ValueError):
                         res.ocr["scan_unavailable"] += 1
             edits = plan_page(page, resolver, res, ocr_cache.get(page.number))
+            if page.number in skip_pages:
+                edits = []
             if any(a.type[0] == pymupdf.PDF_ANNOT_REDACT for a in (page.annots() or [])) and edits:
                 res.reason = "preexisting_redaction_annotation"
                 return res
@@ -511,6 +673,8 @@ def transform_pdf_scoped(src: str | Path, dst: str | Path, resolver: Resolver, *
                 plans[page.number] = edits
         # Second planning sweep: values resolved on later pages also occur on earlier ones.
         for page in doc:
+            if page.number in skip_pages:
+                continue
             extra = [e for e in plan_page(page, resolver, ScopedResult(), ocr_cache.get(page.number))
                      if not any(pymupdf.Rect(e.rect).intersects(pymupdf.Rect(p.rect)) for p in plans.get(page.number, []))]
             if extra:
@@ -524,6 +688,8 @@ def transform_pdf_scoped(src: str | Path, dst: str | Path, resolver: Resolver, *
         pairs = {k: v.pseudonym for k, v in resolver.local.items()}
         res.resolved_values = list(pairs)
         all_edits = [e for es in plans.values() for e in es]
+        res.planned_pages = sorted(plans)
+        res.metadata_planned = bool(pairs)
         res.edits_planned = len(all_edits)
         res.ocr["edits_planned"] += sum(e.source.startswith("ocr") for e in all_edits)
         keep: dict[int, list] = {}
@@ -546,6 +712,8 @@ def transform_pdf_scoped(src: str | Path, dst: str | Path, resolver: Resolver, *
                 graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED if is_ocr else pymupdf.PDF_REDACT_LINE_ART_NONE,
                 text=pymupdf.PDF_REDACT_TEXT_REMOVE)
             res.links_restored += restore_links(doc, page, snap, order)
+            if not is_ocr:
+                res.reflow_fixed += _fix_redaction_shift(doc, page, keep[pno], edits)
             for e in edits:
                 if not e.new:
                     continue
@@ -566,6 +734,8 @@ def transform_pdf_scoped(src: str | Path, dst: str | Path, resolver: Resolver, *
         doc.close()
 
     reason = _verify(src, tmp, plans, keep, before, geometry, pairs, res, render_check, ocr)
+    if reason == "resolved_value_residual" and res.changes:
+        res.partial, reason = True, ""  # every check but residual passed: keep the verified partial rewrite
     if reason:
         res.reason = reason
         tmp.unlink(missing_ok=True)
@@ -600,18 +770,20 @@ def _verify(src, out_path, plans, keep, before, geometry, pairs, res: ScopedResu
             ocr_rects = [pymupdf.Rect(e.rect) for e in edits if e.source.startswith("ocr")]
             if _drawings_fp(page, ocr_rects) != before[pno][0]:
                 failed_checks["vector_graphics_changed"] += 1
+                res.bad_pages.add(pno)
             if _images_fp(page, ocr_rects) != before[pno][1]:
                 failed_checks["images_changed"] += 1
+                res.bad_pages.add(pno)
             if ocr_rects and not _render_outside_unchanged(srcdoc[pno], page, ocr_rects + [
                     _inserted_rect(e) for e in edits if e.source.startswith("ocr")]):
                 failed_checks["ocr_region_overflow"] += 1
+                res.bad_pages.add(pno)
             if not edits:
                 continue
             chars = _chars(page)
-            have = Counter((c, _rkey(b)) for c, b in chars)
-            need = Counter(keep[pno])
-            if need - have:
+            if _lost_chars(keep[pno], chars):
                 failed_checks["text_outside_edit_regions_changed"] += 1
+                res.bad_pages.add(pno)
             lines = page_lines(page)
             for e in edits:
                 r = pymupdf.Rect(e.rect)
@@ -633,6 +805,7 @@ def _verify(src, out_path, plans, keep, before, geometry, pairs, res: ScopedResu
                 e.status = "verified" if not why else f"failed:{why}"
                 if why:
                     failed_checks["edit_verification_failed"] += 1
+                    res.bad_pages.add(pno)
                     res.checks[f"edit:{why}"] += 1
                 res.trace.append({"page": pno, "rect": [round(x, 2) for x in e.rect], "kind": e.kind,
                                   "source": e.source, "fitted": e.fitted, "status": e.status})

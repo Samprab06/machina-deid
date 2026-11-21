@@ -111,7 +111,7 @@ class EntityMapBuilder:
             o = self._obs[n]
             o.docs.add(rel)
             o.families.add(fam)
-            o.labeled += f.source.startswith(("label", "structured")) or f.source == "inline"
+            o.labeled += f.source.startswith(("label", "structured")) or f.source in ("inline", "inline_row")
             if f.source.startswith("structured:ole"):
                 o.ole.add(f.value)
                 continue

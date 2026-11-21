@@ -288,6 +288,36 @@ def _associate(label: Line, cands: list[Line], max_dist: float) -> tuple[Line, s
     return None
 
 
+_DATE_TAIL = re.compile(r"(?:\s+(?:\d{1,4}[./-]\d{1,2}[./-]\d{1,4}|\d{1,2}[./-][A-Za-z]{3}[./-]\d{2,4}|"
+                        r"\d{1,2}\s+[A-Za-z]{3}\s+\d{2,4}))+\s*$")
+# Title-block row merged into one extracted line: "APPROVED Ana Duarte" / "DRN J. SMITH 02.03.21" (no colon).
+# Past-tense / abbreviated labels only ("DESIGN LOAD", "CHECK VALVE" are not rows).
+_ROW_LABELS = {
+    "drawn": r"drawn|drn|dwn|drafted|gezeichnet|dessin[ée]",
+    "designed": r"designed|dsgn|konstruiert|bearbeitet",
+    "checked": r"checked|chk|chkd|ckd|gepr[üu]ft|v[ée]rifi[ée]",
+    "approved": r"approved|appd|apvd|app'd|freigegeben|approuv[ée]",
+    "reviewed": r"reviewed",
+}
+_ROW_RES = {role: re.compile(rf"^\s*(?P<label>{rx})\s*[.:]?\s+(?P<value>\S.*)$", re.I)
+            for role, rx in _ROW_LABELS.items()}
+_ROW_STOP = frozenset("to for by the and of with per as at on in not no is are be all see from or".split())
+
+
+def _row_value_ok(v: str) -> bool:
+    toks = [t.lower().strip(".,") for t in v.split()]
+    return 1 <= len(toks) <= 4 and not any(t in _ROW_STOP or t in _ENGINEERING_WORDS for t in toks)
+
+
+def _value_span(text: str, a: int, b: int) -> tuple[int, int]:
+    """Strip separators and trailing date column(s) merged into the same extracted line."""
+    a, b = _strip_span(text, a, b)
+    m = _DATE_TAIL.search(text[a:b])
+    if m and m.start() > 0:
+        b = a + m.start()
+    return _strip_span(text, a, b)
+
+
 def scan_page_lines(lines: list[Line]) -> list[Finding]:
     """Role-label + pattern findings on one page's split lines."""
     out: list[Finding] = []
@@ -308,7 +338,7 @@ def scan_page_lines(lines: list[Line]) -> list[Finding]:
             got = _associate(ln, lines, max_dist)
             if got:
                 c, how = got
-                a, b = _strip_span(c.text, 0, len(c.text))
+                a, b = _value_span(c.text, 0, len(c.text))
                 kind = role_kind(role)
                 if kind in ("email", "phone"):
                     continue  # handled by the patterns below (value shape is required)
@@ -316,15 +346,27 @@ def scan_page_lines(lines: list[Line]) -> list[Finding]:
                     add(Finding(ln.page, kind, c.text[a:b], role, how, c, a, b,
                                 "high" if how == "label_right" else "medium"))
             continue
+        matched = False
         for rx in (_INLINE_PERSON, *_INLINE_RES.values()):
             m = rx.match(ln.text)
             if not m:
                 continue
+            matched = True
             r = match_label(m.group("label")) or "issued"
             kind = role_kind(r)
-            a, b = _strip_span(ln.text, m.start("value"), len(ln.text))
+            a, b = _value_span(ln.text, m.start("value"), len(ln.text))
             if kind not in ("email", "phone") and valid_value(kind, ln.text[a:b]):
                 add(Finding(ln.page, kind, ln.text[a:b], r, "inline", ln, a, b, "high"))
+            break
+        if matched:
+            continue
+        for role, rx in _ROW_RES.items():
+            m = rx.match(ln.text)
+            if not m:
+                continue
+            a, b = _value_span(ln.text, m.start("value"), len(ln.text))
+            if valid_value("person", ln.text[a:b]) and _row_value_ok(ln.text[a:b]):
+                add(Finding(ln.page, "person", ln.text[a:b], role, "inline_row", ln, a, b, "medium"))
             break
     for ln in lines:
         for m in EMAIL_RE.finditer(ln.text):
