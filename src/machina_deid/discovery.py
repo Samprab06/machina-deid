@@ -120,8 +120,10 @@ def _mk(out: list[Candidate], kind: str, value: str, location: str, confidence: 
 
 
 def discover_step(path: str | Path, *, include_software: bool = False, include_timestamps: bool = False,
-                  include_description: bool = True) -> list[Candidate]:
-    """Header fields of an ISO-10303-21 file. DATA is never read."""
+                  include_description: bool = True, include_data_orgs: bool = True) -> list[Candidate]:
+    """Header fields of an ISO-10303-21 file, plus (``include_data_orgs``) the exact decoded ``name`` of
+    in-scope DATA ``ORGANIZATION`` entities (see :mod:`step_data_transform`). DATA organization names are
+    kind ``org_name`` (review-required by policy, never auto-approved); placeholders are dropped."""
     hdr, _ = st.read_step_header(path)
     out: list[Candidate] = []
     counters: dict[str, int] = {}
@@ -151,6 +153,16 @@ def discover_step(path: str | Path, *, include_software: bool = False, include_t
                 if not directives:
                     _mk(out, "description", text, f"step:FILE_DESCRIPTION.description[{k}]", "low",
                         "free-text description; review manually")
+    if include_data_orgs:
+        from .step_data_transform import StepDataError, organization_names
+        try:
+            names = organization_names(path)
+        except StepDataError:
+            names = []  # DATA not structurally parseable: no DATA candidates, and DATA is never transformed
+        for k, (_, value) in enumerate(names):
+            if _plausible(value) is None:  # exact value kept (not stripped) so transform matching is exact
+                out.append(Candidate("org_name", value, f"step:DATA.ORGANIZATION.name[{k}]", "medium",
+                                     "ISO 10303-41 ORGANIZATION.name in DATA; requires typed org approval"))
     return out
 
 

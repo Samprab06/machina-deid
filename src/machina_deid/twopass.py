@@ -8,7 +8,8 @@ conservative auto-approval policy (:func:`auto_decision`) records approve/review
 Pass 2 (:func:`transform_file`): candidates are re-discovered from the *current* file and
 :func:`build_identity_map` asks the catalog which exact values are approved, returning an in-memory
 :class:`IdentityMap` (strings only). No raw map file is ever written. The existing transformers are used
-unchanged; STEP remains FILE_NAME-header only (DATA section analysis-only, never rewritten).
+unchanged. For STEP, FILE_NAME header strings use the untyped map, and the only DATA rewrite is
+``ORGANIZATION.name`` (:mod:`step_data_transform`), only for values approved under the typed ``org`` kind.
 """
 from __future__ import annotations
 
@@ -30,7 +31,8 @@ from .idmap import IdentityMap
 SUPPORTED = ("pdf", "dxf", "step", "zip")
 _AUTO_LOCATIONS = re.compile(r"^(?:pdf:metadata\.author|step:FILE_NAME\.(?:author|organization)\[\d+\])$")
 _NEVER_AUTO = {"file_name", "project", "part", "description", "text_label_value", "path_component",
-               "software_or_authorization", "timestamp"}
+               "software_or_authorization", "timestamp", "org_name"}
+DATA_ORG_KIND = "org_name"  # STEP DATA ORGANIZATION.name candidates; replaced only via typed ``org`` approval
 
 
 @dataclass
@@ -260,6 +262,8 @@ def build_identity_map(cat: IdentityCatalog, candidates: list[Candidate]) -> tup
     st = MapStats(candidates=len(candidates))
     seen: set[str] = set()
     for c in candidates:
+        if c.kind == DATA_ORG_KIND:  # handled only by build_org_map (typed)
+            continue
         if c.value in seen:
             continue
         seen.add(c.value)
@@ -272,6 +276,57 @@ def build_identity_map(cat: IdentityCatalog, candidates: list[Candidate]) -> tup
     return IdentityMap(strings=strings), st
 
 
+def build_org_map(cat: IdentityCatalog, candidates: list[Candidate]) -> tuple[dict[str, str], int]:
+    """Exact decoded DATA ORGANIZATION names -> pseudonym, only where approved under kind ``org``.
+    Returns ``(map, approved_under_other_kind)``; the latter are left unchanged and reported as residual."""
+    out: dict[str, str] = {}
+    other = 0
+    for c in candidates:
+        if c.kind != DATA_ORG_KIND or c.value in out:
+            continue
+        hit = cat.approved_pseudonym(c.value, kind="org")
+        if hit is not None and hit[1] != c.value:
+            out[c.value] = hit[1]
+        elif cat.approved_pseudonym(c.value) is not None:
+            other += 1
+    return out, other
+
+
+def _transform_step(src: Path, dst: Path, idmap: IdentityMap, org_map: dict[str, str], out, overwrite: bool):
+    """Header stage (FILE_NAME, untyped map) then DATA stage (ORGANIZATION.name, typed org map)."""
+    from .step_data_transform import transform_organizations
+    from .step_transform import transform_step
+    if dst.exists() and not overwrite:
+        raise FileExistsError("output exists")
+    stage = src
+    with tempfile.TemporaryDirectory(prefix="deid-step-", dir=dst.parent) as work:
+        if idmap.strings:
+            mid = Path(work) / "header.stp"
+            r = transform_step(src, mid, idmap)
+            out.residual_approved += _sum(r.unmodifiable) + _sum(r.mapped_present_in_unrequested_fields)
+            if r.outcome == "transformed_validated":
+                out.fields_replaced += _sum(r.replacements)
+                stage = mid
+            elif not r.ok:
+                out.reason = r.reason or r.outcome
+                return False
+        if org_map:
+            d = transform_organizations(stage, dst, org_map, overwrite=overwrite)
+            out.residual_approved += d.unmodifiable
+            if d.outcome == "transformed_validated":
+                out.fields_replaced += _sum(d.replacements)
+                out.data_organizations_replaced = _sum(d.replacements)
+                return True
+            if not d.ok:
+                out.reason = "data:" + (d.reason or d.outcome)
+                return False
+        if stage is src:
+            out.reason = "no_exact_match_in_transformable_fields"
+            return False
+        os.replace(stage, dst)
+        return True
+
+
 @dataclass
 class TransformOutcome:
     path: str
@@ -281,6 +336,7 @@ class TransformOutcome:
     fields_replaced: int = 0
     residual_approved: int = 0
     approved_values: int = 0
+    data_organizations_replaced: int = 0
     source_unchanged: bool = True
     output_written: bool = False
 
@@ -309,8 +365,10 @@ def transform_file(cat: IdentityCatalog, src: str | Path, dst: str | Path, rel_p
         return out
     cands = [c for d in found for c in d.candidates]
     idmap, st = build_identity_map(cat, cands)
-    out.approved_values = st.approved_values
-    if not idmap.strings:
+    org_map, org_other = build_org_map(cat, cands) if fmt == "step" else ({}, 0)
+    out.approved_values = st.approved_values + len(org_map)
+    out.residual_approved = org_other
+    if not idmap.strings and not org_map:
         out.status, out.reason = "no_approved_identities", "nothing approved for current candidates"
         out.source_unchanged = _sha_file(src) == before
         return out
@@ -326,12 +384,8 @@ def transform_file(cat: IdentityCatalog, src: str | Path, dst: str | Path, rel_p
             out.fields_replaced = _sum(r.text_replacements) + r.header_replacements
             out.residual_approved = _sum(r.residual_in_entities) + _sum(r.residual_raw)
         elif fmt == "step":
-            from .step_transform import transform_step
-            r = transform_step(src, dst, idmap, overwrite=overwrite)
-            ok = r.ok
-            out.fields_replaced = _sum(r.replacements)
-            out.residual_approved = _sum(r.unmodifiable) + _sum(r.mapped_present_in_unrequested_fields)
-            out.reason = r.reason
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            ok = _transform_step(src, dst, idmap, org_map, out, overwrite)
         else:
             r = ar.transform_zip(src, dst, idmap, overwrite=overwrite)
             ok = r.ok

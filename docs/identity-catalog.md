@@ -83,3 +83,40 @@ Schema v2 adds an `approvals` table (one row per exact `(kind, normalized value)
 CLI: `python -m machina_deid catalog {discover|report|approve|reject|review|alias|transform} --catalog DB
 [--secret-file F]`. Values for approve/reject/review/alias are read from stdin, one per line, and are never
 passed in argv.
+
+## Phase 5D: STEP DATA `ORGANIZATION.name`
+
+`step_data_transform.py` is the only STEP DATA rewrite. Schema (ISO 10303-41):
+
+```
+ENTITY organization;
+  id          : OPTIONAL identifier;  -- parameter 1 (index 0), never touched
+  name        : label;                -- parameter 2 (index 1), the only value replaced
+  description : OPTIONAL text;        -- parameter 3 (index 2), never touched
+END_ENTITY;
+```
+
+Organization roles are not attributes of `ORGANIZATION`. They are carried by `ORGANIZATION_ROLE` and the
+`*_ORGANIZATION_ASSIGNMENT` entities, which are not modified.
+
+- Scope: the instance must be simple (not a complex entity), its type must be exactly `ORGANIZATION`, it
+  must have exactly 3 top-level parameters, and `name` must be a plain string literal. Records are
+  located with the structural `step_analysis` scanner. No regex runs over DATA.
+- Match: the literal is decoded (`''`, `\\`, `\X\`, `\X2\`, `\X4\`, `\S\`, and raw UTF-8 bytes). It is
+  replaced only if the decoded value is exactly (character for character) a key of the in-memory org map.
+  Undecodable names are reported as unmodifiable and left unchanged.
+- Approval: discovery emits kind `org_name` (`step:DATA.ORGANIZATION.name[k]`, medium). Policy always
+  sends it to `review`, and placeholders (`UNKNOWN`, `NONE`, ...) are dropped. `twopass.build_org_map`
+  includes a value only if the catalog has it approved under the typed `org` kind. A value approved under
+  another kind (for example `text`) is not replaced in DATA and is counted as `residual_approved`. The
+  catalog's notion of "the same identity" is its normalization (NFKC/casefold/whitespace). The splice
+  itself requires the exact string the current file contains.
+- Pipeline: `transform_file` runs the FILE_NAME header stage (untyped map) first, then the DATA stage. ZIP
+  members still get the header stage only.
+- Verification (fail-closed, nothing written on failure): the output is reparsed. The header bytes, entity
+  id/type/arity/reference lists and per-entity string counts must be identical. The numeric-token sequence
+  outside literals must be identical. All bytes outside the edited literals must be identical, and each
+  edited literal must decode to the planned pseudonym. The write is atomic, and running the transform
+  again on its own output is a no-op.
+- **Limitation:** no geometry/topology validation is performed, because no trusted geometry kernel is
+  available. Geometric validity is inferred only from the structural and numeric invariants above.

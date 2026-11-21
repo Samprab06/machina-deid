@@ -73,6 +73,11 @@ class _Record:
     strings: list[tuple[str, str, int, bool]] = field(default_factory=list)  # (path, type, len, truncated) + raw kept separately
     raws: list[str] = field(default_factory=list)
     refs: list[tuple[str, int]] = field(default_factory=list)
+    # byte/char offsets (opening quote, just past closing quote), parallel to ``strings``
+    spans: list[tuple[int, int]] = field(default_factory=list)
+    arity: list[int] = field(default_factory=list)  # top-level parameter count per type
+    start: int = 0  # offset of '#'
+    end: int = 0  # offset just past ';'
 
 
 class _Scanner:
@@ -202,6 +207,7 @@ class _Scanner:
             self._resync()
             self.issues.append("malformed_record")
             return "skip"
+        rstart = self.i
         self.i += 1
         eid = self.read_int()
         self.skip_ws()
@@ -211,7 +217,7 @@ class _Scanner:
             return "skip"
         self.i += 1
         self.skip_ws()
-        rec = _Record(eid=eid, types=[])
+        rec = _Record(eid=eid, types=[], start=rstart)
         if self.i < self.n and s[self.i] == "(":
             # complex entity: ( A(...) B(...) )
             self.i += 1
@@ -245,6 +251,7 @@ class _Scanner:
         else:
             self.issues.append("missing_semicolon")
             self._resync()
+        rec.end = self.i
         return rec
 
     def _resync(self) -> None:
@@ -275,9 +282,11 @@ class _Scanner:
             c = s[self.i]
             p = prefix + ".".join(map(str, path))
             if c == "'":
+                st = self.i
                 raw, ln, tr = self.read_string()
                 rec.strings.append((p, etype, ln, tr))
                 rec.raws.append(raw)
+                rec.spans.append((st, self.i))
             elif c == "#":
                 self.i += 1
                 ref = self.read_int()
@@ -290,6 +299,8 @@ class _Scanner:
                 continue
             elif c == ")":
                 self.i += 1
+                if len(path) == 1:
+                    rec.arity.append(path[0] + 1)
                 path.pop()
                 if not path:
                     return
