@@ -8,6 +8,12 @@ copy otherwise) -> hash the output -> record validation.
 Safety properties
 - Sources are opened read-only and never modified or deleted; the output root and work
   directory must not overlap the source root (or each other).
+- STEP files are rewritten only in explicitly mapped FILE_NAME header strings (see
+  ``step_transform``); DATA is byte-identical. No header match -> passed through with
+  outcome ``inspected_no_identifiers``; unreplaceable match -> nothing materialized.
+- Every record carries an explicit ``outcome``: transformed_validated, inspected_no_identifiers,
+  unsupported_passthrough, identifiers_unmodifiable or failed_validation.
+  Pass-through is never reported as de-identified.
 - PDF/DXF are transformed only when an explicit identity map for that format is given;
   otherwise they are passed through unchanged with a ``no_identity_map`` limitation.
   Nothing is inferred or guessed.
@@ -36,7 +42,7 @@ from .state import StateDB, StateError, output_path_for
 HARD_MAX_FILES = 5000
 DEFAULT_MAX_BYTES = 5 * 1024**3
 DEFAULT_MIN_FREE = 5 * 1024**3
-_TRANSFORMERS = {"pdf", "dxf"}
+_TRANSFORMERS = {"pdf", "dxf", "step"}
 
 
 class ProcessError(Exception):
@@ -108,6 +114,8 @@ def _variant(rec_transformer: str | None, maps: dict[str, tuple[IdentityMap, str
     """Return (variant key, transformer kind or None). Variant ties the artifact to the map bytes."""
     if rec_transformer in maps:
         return f"{rec_transformer}-{maps[rec_transformer][1][:16]}", rec_transformer
+    if rec_transformer in _TRANSFORMERS:
+        return f"{rec_transformer}-no-map", rec_transformer
     return "passthrough", None
 
 
@@ -133,31 +141,65 @@ def _atomic_copy(src: Path, dst: Path) -> None:
             tmp.unlink()
 
 
+def _passthrough(src: Path, sha: str, cas: Path) -> str:
+    _atomic_copy(src, cas)
+    out_sha = sha256_file(cas)
+    if out_sha != sha:
+        cas.unlink()  # our own just-created copy
+        raise _Fail("source_changed_during_copy")
+    return out_sha
+
+
 def _build_artifact(src: Path, sha: str, variant: str, kind: str | None, cas: Path,
                     maps: dict[str, tuple[IdentityMap, str]], tmp_dir: Path):
-    """Create the CAS artifact; return (output_sha, disposition, note, validation) or raise _Fail."""
+    """Create the CAS artifact; return (output_sha, disposition, note, validation, outcome) or raise _Fail."""
     if kind is None:
-        _atomic_copy(src, cas)
-        out_sha = sha256_file(cas)
-        if out_sha != sha:
-            cas.unlink()  # our own just-created copy
-            raise _Fail("source_changed_during_copy")
-        return out_sha, "passthrough", None, "bytes_identical"
+        return _passthrough(src, sha, cas), "passthrough", None, "bytes_identical", "unsupported_passthrough"
+    if kind not in maps:
+        from . import discovery
+        try:
+            if kind == "pdf":
+                candidates = discovery.discover_pdf(src)
+            elif kind == "dxf":
+                candidates = discovery.discover_dxf(src)
+            else:
+                candidates = discovery.discover_step(src)
+        except Exception as exc:
+            raise _Fail(f"inspection_error_{type(exc).__name__}") from None
+        if candidates:
+            return (_passthrough(src, sha, cas), "passthrough",
+                    f"{kind}_identifiers_detected_without_explicit_map", "bytes_identical",
+                    "identifiers_unmodifiable")
+        return (_passthrough(src, sha, cas), "passthrough",
+                f"{kind}_inspected_no_detected_identifiers", "bytes_identical",
+                "inspected_no_identifiers")
     tmp_dir.mkdir(parents=True, exist_ok=True)
     tmp = tmp_dir / f"{uuid.uuid4().hex[:12]}.{kind}"
     try:
         if kind == "pdf":
             from .pdf_transform import transform_pdf as fn
-        else:
+        elif kind == "dxf":
             from .dxf_transform import transform_dxf as fn
+        else:
+            from .step_transform import transform_step as fn
         try:
             res = fn(src, tmp, maps[kind][0])
         except Exception as exc:  # corrupt/encrypted input etc.; message may contain content, keep type only
             raise _Fail(f"transform_error_{type(exc).__name__}") from None
-        if not res.ok:
+        if kind == "step":
+            if res.outcome == "inspected_no_identifiers":
+                return (_passthrough(src, sha, cas), "passthrough", "step_header_inspected_no_explicit_match",
+                        "bytes_identical", "inspected_no_identifiers")
+            if res.outcome == "identifiers_unmodifiable":
+                raise _Fail("identifiers_unmodifiable", "identifiers_unmodifiable")
+            if res.outcome != "transformed_validated" or not res.ok:
+                raise _Fail("step_" + (res.reason or "validation_failed"))
+            if res.source_sha256 != sha:
+                raise _Fail("source_changed_during_read")
+        elif not res.ok:
             raise _Fail("validation_failed")
         _atomic_copy(tmp, cas)
-        return sha256_file(cas), "transformed", None, "ok"
+        return sha256_file(cas), "transformed", None, "ok", "transformed_validated"
     finally:
         for leftover in (tmp, tmp.with_name(tmp.name + ".partial")):
             if leftover.exists():
@@ -165,7 +207,16 @@ def _build_artifact(src: Path, sha: str, variant: str, kind: str | None, cas: Pa
 
 
 class _Fail(Exception):
-    pass
+    def __init__(self, category: str, outcome: str = "failed_validation"):
+        super().__init__(category)
+        self.outcome = outcome
+
+
+def _ensure_readonly(p: Path) -> None:
+    """CAS files may be hardlinked into outputs; make them read-only so shared content cannot be mutated."""
+    mode = p.stat().st_mode
+    if mode & 0o222:
+        os.chmod(p, mode & ~0o222)
 
 
 def _materialize(cas: Path, target: Path, expected_sha: str, mode: str) -> str:
@@ -176,6 +227,7 @@ def _materialize(cas: Path, target: Path, expected_sha: str, mode: str) -> str:
         return "existing"
     target.parent.mkdir(parents=True, exist_ok=True)
     if mode == "auto":
+        _ensure_readonly(cas)
         try:
             os.link(cas, target)  # atomic, refuses to overwrite
             return "hardlink"
@@ -189,14 +241,14 @@ def _materialize(cas: Path, target: Path, expected_sha: str, mode: str) -> str:
 
 
 def plan(manifest: str | Path, source_root: str | Path, *, limit: int, pdf_map: str | None = None,
-         dxf_map: str | None = None) -> dict:
+         dxf_map: str | None = None, step_map: str | None = None) -> dict:
     """Dry run: classify + hash the first ``limit`` rows and report what ``process`` would do. Writes nothing."""
     _bounds(limit, None)
     root = Path(source_root).resolve()
     rows, bad = mf.parse_manifest(manifest)
     rows = rows[:limit]
-    kinds = {k for k, v in (("pdf", pdf_map), ("dxf", dxf_map)) if v}
-    for v in (pdf_map, dxf_map):
+    kinds = {k for k, v in (("pdf", pdf_map), ("dxf", dxf_map), ("step", step_map)) if v}
+    for v in (pdf_map, dxf_map, step_map):
         if v:
             load_idmap(v)  # validate only
     by_disp, groups, bytes_unique, bytes_total = Counter(), Counter(), 0, 0
@@ -236,7 +288,7 @@ def _bounds(limit: int, max_bytes: int | None) -> None:
 
 def process(manifest: str | Path, source_root: str | Path, output_root: str | Path, work_dir: str | Path, *,
             limit: int, max_bytes: int | None = DEFAULT_MAX_BYTES, pdf_map: str | None = None,
-            dxf_map: str | None = None, link_mode: str = "auto", retry_failed: bool = False,
+            dxf_map: str | None = None, step_map: str | None = None, link_mode: str = "auto", retry_failed: bool = False,
             min_free: int = DEFAULT_MIN_FREE) -> dict:
     """Ingest up to ``limit`` manifest rows and process up to ``limit`` pending records. Resumable."""
     _bounds(limit, max_bytes)
@@ -244,7 +296,7 @@ def process(manifest: str | Path, source_root: str | Path, output_root: str | Pa
         raise ProcessError("link_mode must be 'auto' or 'copy'")
     root, out_root, work = check_layout(Path(source_root), Path(output_root), Path(work_dir))
     maps: dict[str, tuple[IdentityMap, str]] = {}
-    for kind, path in (("pdf", pdf_map), ("dxf", dxf_map)):
+    for kind, path in (("pdf", pdf_map), ("dxf", dxf_map), ("step", step_map)):
         if path:
             try:
                 maps[kind] = (load_idmap(path), sha256_file(Path(path)))
@@ -315,13 +367,13 @@ def _process_one(db, rec, root, out_root, cas_dir, tmp_dir, maps, link_mode, sta
         else:
             if cas.exists():
                 cas.unlink()  # unvalidated/corrupt CAS leftover of ours, never a validated output
-            out_sha, disp, note, val = _build_artifact(src, sha, variant, kind, cas, maps, tmp_dir)
+            out_sha, disp, note, val, outcome = _build_artifact(src, sha, variant, kind, cas, maps, tmp_dir)
             if rec["transformer"] and kind is None:
                 note = "no_identity_map_supplied"
             elif kind is None:
                 note = "unsupported_format_unchanged"
             os.chmod(cas, 0o444)
-            db.put_content(sha, variant, cas, out_sha, cas.stat().st_size, disp, note, val)
+            db.put_content(sha, variant, cas, out_sha, cas.stat().st_size, disp, note, val, outcome)
             row = db.get_content(sha, variant)
             verified_cas[str(cas)] = True
             stats["artifacts_built"] += 1
@@ -329,14 +381,19 @@ def _process_one(db, rec, root, out_root, cas_dir, tmp_dir, maps, link_mode, sta
         out_sha = row["output_sha256"] if link in ("hardlink", "existing") else sha256_file(target)
         if link == "existing":
             out_sha = sha256_file(target)
+        outcome = row["outcome"] or ("transformed_validated" if row["disposition"] == "transformed"
+                                     else "unsupported_passthrough")
         db.mark_transformed(rid, target, out_sha, disposition=row["disposition"], note=row["note"],
-                            link_kind=link)
+                            link_kind=link, outcome=outcome)
         db.mark_validated(rid, row["validation_status"])
         stats[f"{row['disposition']}"] += 1
+        stats[f"outcome_{outcome}"] += 1
         stats[f"link_{link}"] += 1
     except _Fail as f:
-        db.mark_failed(rid, str(f))
+        db.mark_failed(rid, str(f), outcome=f.outcome)
         stats["failed"] += 1
+        stats[f"outcome_{f.outcome}"] += 1
     except OSError as exc:
-        db.mark_failed(rid, f"os_error_{type(exc).__name__}")
+        db.mark_failed(rid, f"os_error_{type(exc).__name__}", outcome="failed_validation")
         stats["failed"] += 1
+        stats["outcome_failed_validation"] += 1

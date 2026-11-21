@@ -71,7 +71,8 @@ def test_passthrough_aliases_and_hashes(env):
     assert rows["a/b/copy_of_one.sldprt"]["output_sha256"] == r["output_sha256"]
     # PDFs without a map are passed through unchanged with a limitation, never guessed
     pdf = rows["a/doc.pdf"]
-    assert pdf["note"] == "no_identity_map_supplied" and pdf["disposition"] == "passthrough"
+    assert pdf["note"] == "pdf_identifiers_detected_without_explicit_map" and pdf["disposition"] == "passthrough"
+    assert pdf["outcome"] == "identifiers_unmodifiable"
     assert (out / "a/doc.pdf").read_bytes() == (env["src"] / "a/doc.pdf").read_bytes()
     assert rows["a/fake.pdf"]["status"] == "skipped" and rows["a/fake.pdf"]["error_category"] == "classification_mismatch"
     assert rows["a/missing.bin"]["status"] == "skipped"
@@ -201,3 +202,35 @@ def test_transfer_rejects_bad_dest(tmp_path):
     for bad in ("-oProxyCommand=x", "/local/path", "host:relative", "host"):
         with pytest.raises(tr.TransferError):
             tr.build_commands(tmp_path, bad)
+
+
+@pytest.mark.parametrize('mapping,expected,status', [
+    ({NAME: 'Person A'}, 'transformed_validated', 'validated'),
+    ({'Nobody Here': 'Person A'}, 'inspected_no_identifiers', 'validated'),
+    ({NAME: 'Zoë'}, 'identifiers_unmodifiable', 'failed'),
+])
+def test_step_outcomes_and_cached_aliases(tmp_path, mapping, expected, status):
+    from step_helpers import step_bytes
+    src, out, work = (tmp_path / n for n in ('src', 'out', 'work'))
+    src.mkdir()
+    for name in ('one.step', 'two.step'):
+        (src / name).write_bytes(step_bytes())
+    manifest = tmp_path / 'manifest.tsv'
+    manifest.write_text(''.join(f'{n}\t{(src / n).stat().st_size}\t\n'
+                                for n in ('one.step', 'two.step')))
+    idmap = tmp_path / 'map.json'
+    idmap.write_text(json.dumps({'strings': mapping}))
+    args = (manifest, src, out, work)
+    result = pr.process(*args, limit=2, step_map=str(idmap), min_free=0)
+    assert result['this_run'][f'outcome_{expected}'] == 2
+    from contextlib import closing
+    with closing(StateDB(work / 'state.sqlite')) as db:
+        rows = list(db.conn.execute('SELECT * FROM records'))
+        assert len(rows) == 2
+        assert all(r['outcome'] == expected and r['status'] == status for r in rows)
+    if status == 'failed':
+        assert not list(out.rglob('*.step'))
+    else:
+        assert result['this_run']['cas_reused'] == 1
+        assert all((out / n).is_file() for n in ('one.step', 'two.step'))
+    assert pr.process(*args, limit=2, step_map=str(idmap), min_free=0)['claimed'] == 0

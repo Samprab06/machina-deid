@@ -57,12 +57,14 @@ CREATE TABLE IF NOT EXISTS content (
   note TEXT,
   validation_status TEXT NOT NULL,
   created_at TEXT NOT NULL,
+  outcome TEXT,
   PRIMARY KEY (input_sha256, variant)
 );
 """
 
 # Columns added after the first release; applied idempotently to older databases.
-_MIGRATIONS = (("disposition", "TEXT"), ("note", "TEXT"), ("link_kind", "TEXT"))
+_MIGRATIONS = (("disposition", "TEXT"), ("note", "TEXT"), ("link_kind", "TEXT"), ("outcome", "TEXT"))
+_CONTENT_MIGRATIONS = (("outcome", "TEXT"),)
 
 
 class StateError(Exception):
@@ -102,6 +104,10 @@ class StateDB:
         for col, typ in _MIGRATIONS:
             if col not in have:
                 self.conn.execute(f"ALTER TABLE records ADD COLUMN {col} {typ}")
+        have = {r["name"] for r in self.conn.execute("PRAGMA table_info(content)")}
+        for col, typ in _CONTENT_MIGRATIONS:
+            if col not in have:
+                self.conn.execute(f"ALTER TABLE content ADD COLUMN {col} {typ}")
 
     def close(self) -> None:
         self.conn.close()
@@ -211,14 +217,18 @@ class StateDB:
                                  (input_sha256, variant)).fetchone()
 
     def put_content(self, input_sha256: str, variant: str, cas_path: str | Path, output_sha256: str, size: int,
-                    disposition: str, note: str | None, validation_status: str) -> None:
+                    disposition: str, note: str | None, validation_status: str,
+                    outcome: str | None = None) -> None:
         with self._tx() as c:
-            c.execute("INSERT OR REPLACE INTO content VALUES (?,?,?,?,?,?,?,?,?)",
+            c.execute("INSERT OR REPLACE INTO content(input_sha256, variant, cas_path, output_sha256, size,"
+                      " disposition, note, validation_status, created_at, outcome) VALUES (?,?,?,?,?,?,?,?,?,?)",
                       (input_sha256, variant, str(cas_path), output_sha256, size, disposition, note,
-                       validation_status, _now()))
+                       validation_status, _now(), outcome))
 
-    def mark_failed(self, rid: int, error_category: str, validation_status: str | None = None) -> None:
-        self._transition(rid, FAILED, error_category=error_category, validation_status=validation_status)
+    def mark_failed(self, rid: int, error_category: str, validation_status: str | None = None,
+                    outcome: str | None = None) -> None:
+        self._transition(rid, FAILED, error_category=error_category, validation_status=validation_status,
+                         outcome=outcome)
 
     def mark_skipped(self, rid: int, reason: str) -> None:
         self._transition(rid, SKIPPED, error_category=reason)

@@ -16,7 +16,7 @@ from .classify import classify_path
 from .idmap import IdentityMapError, load as load_idmap
 from .state import StateDB, output_path_for
 
-_TRANSFORMER_BY_FORMAT = {"pdf": "pdf", "dxf": "dxf"}
+_TRANSFORMER_BY_FORMAT = {"pdf": "pdf", "dxf": "dxf", "step": "step"}
 
 
 def _reserves(items: list[str]) -> dict[str, int]:
@@ -91,6 +91,9 @@ def _run_transform(kind: str, a) -> int:
     if kind == "pdf":
         from .pdf_transform import transform_pdf
         res = transform_pdf(a.input, a.output, idmap, overwrite=a.overwrite)
+    elif kind == "step":
+        from .step_transform import transform_step
+        res = transform_step(a.input, a.output, idmap, overwrite=a.overwrite)
     else:
         from .dxf_transform import transform_dxf
         res = transform_dxf(a.input, a.output, idmap, overwrite=a.overwrite)
@@ -102,11 +105,12 @@ def cmd_process(a) -> int:
     from . import process as pr
     try:
         if a.dry_run:
-            res = pr.plan(a.manifest, a.source_root, limit=a.limit, pdf_map=a.pdf_map, dxf_map=a.dxf_map)
+            res = pr.plan(a.manifest, a.source_root, limit=a.limit, pdf_map=a.pdf_map, dxf_map=a.dxf_map,
+                          step_map=a.step_map)
         else:
             res = pr.process(a.manifest, a.source_root, a.output_root, a.work_dir, limit=a.limit,
                              max_bytes=mf.parse_size(a.max_bytes), pdf_map=a.pdf_map, dxf_map=a.dxf_map,
-                             link_mode=a.link_mode, retry_failed=a.retry_failed,
+                             step_map=a.step_map, link_mode=a.link_mode, retry_failed=a.retry_failed,
                              min_free=mf.parse_size(a.min_free))
     except (pr.ProcessError, IdentityMapError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -160,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--output-root", default="output")
     s.set_defaults(fn=cmd_state)
 
-    for kind in ("pdf", "dxf"):
+    for kind in ("pdf", "dxf", "step"):
         t = sub.add_parser(kind, help=f"transform one {kind.upper()} with an explicit identity map")
         t.add_argument("input")
         t.add_argument("output")
@@ -178,6 +182,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--min-free", default="5GiB", help="free space to keep on the work filesystem")
     p.add_argument("--pdf-map")
     p.add_argument("--dxf-map")
+    p.add_argument("--step-map", help="explicit identity map for STEP/STP FILE_NAME header strings")
     p.add_argument("--link-mode", choices=["auto", "copy"], default="auto")
     p.add_argument("--retry-failed", action="store_true")
     p.add_argument("--dry-run", action="store_true", help="classify/hash and report the plan; write nothing")

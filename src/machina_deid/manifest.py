@@ -22,8 +22,8 @@ GIB = 1024**3
 _PRIORITY = {
     ".pdf": ("P1", "implemented (PyMuPDF)"),
     ".dxf": ("P1", "implemented (ezdxf)"),
-    ".step": ("P2", "planned (text rewrite)"),
-    ".stp": ("P2", "planned (text rewrite)"),
+    ".step": ("P1", "implemented (header FILE_NAME rewrite; DATA untouched)"),
+    ".stp": ("P1", "implemented (header FILE_NAME rewrite; DATA untouched)"),
     ".zip": ("P2", "planned (container; recurse)"),
     ".7z": ("P2", "planned (container; recurse)"),
     ".png": ("P3", "planned (metadata strip)"),
