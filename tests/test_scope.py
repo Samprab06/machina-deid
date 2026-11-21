@@ -81,14 +81,14 @@ def test_end_to_end_pdf_ole_zip(produced):
         for v in ("Bob Builder", "Carla Tester", "Jane Q. Doe", "Acme Widgets Ltd"):
             assert v not in t, (rel, v)
         assert ("SCALE 1:2" in t or rel == "famB/sheet-3.pdf") and "120" in t
-    # OLE: one account alias everywhere (top level and ZIP member), preview untouched, size/tree identical
+    # OLE: one account alias everywhere (top level and ZIP member), non-image preview path aliased, size/tree identical
     a1, a2 = props((corp / "cad/part1.sldprt").read_bytes()), props((corp / "cad/part2.sldprt").read_bytes())
     assert status["cad/part1.sldprt"] == "transformed" and a1 == a2 and a1[0] != ACCOUNT and len(a1[0]) == len(ACCOUNT)
     o = (corp / "cad/part1.sldprt").read_bytes()
     assert len(o) == len(files["cad/part1.sldprt"]) and cstring(ACCOUNT) not in o
     cf = ot.parse(o)
     prev = next(e for e in cf.streams() if e.path.endswith("PreviewPNG"))
-    assert cf.read(prev) == PREVIEW
+    assert cf.read(prev) == PREVIEW.replace(ACCOUNT.encode('utf-16-le'), a1[0].encode('utf-16-le'))
     assert status["cad/other.sldprt"] == "unsupported_passthrough" or \
         (corp / "cad/other.sldprt").read_bytes() == files["cad/other.sldprt"]
     import io

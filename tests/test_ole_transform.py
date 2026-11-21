@@ -19,7 +19,7 @@ RANDOM = bytes((i * 131 + 7) % 251 for i in range(5000))  # stand-in for a compr
 
 def preview(acc: str) -> bytes:
     """PreviewPNG payload; independent of property vt/code page (CString is always UTF-16)."""
-    return b"\x89PNG" + cstring(acc) + b"\0" * 40
+    return b"\x89PNG\r\n\x1a\n" + cstring(acc) + b"\0" * 40
 
 
 def streams(acc: str, raw_acc: str | None = None, vt=0x1E, author=None, cp=1252, path_acc: str | None = None):

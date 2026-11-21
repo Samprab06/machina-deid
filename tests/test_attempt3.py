@@ -157,3 +157,17 @@ def test_same_identity_twice_with_hyphenated_confusable_is_clean(tmp_path):
     assert "DWG 77-042   SCALE 1:2   Ø120 ±0.05" in t
     ps = o.metadata["author"]
     assert ps != "Ana Duarte" and t.count(ps) == 2
+
+
+def test_ole_preview_stream_written_unless_real_image():
+    """Account inside a path in a non-container preview stream is aliased; a real PNG preview is never written."""
+    from machina_deid import ole_transform as ot
+    from ole_helpers import cfb, summary_info
+    acc, alias = "jqdoe7", "zz81kq"
+    path = ("C:\\Users\\" + acc + "\\x").encode("utf-16-le")
+    for head, written in ((b"\x89PNG preview bytes ", True), (b"\x89PNG\r\n\x1a\n", False)):
+        src = cfb({"\x05SummaryInformation": summary_info({8: (0x1E, acc)}), "PreviewPNG": head + path})
+        res = ot.transform(src, {acc: alias})
+        assert res.reason is None
+        assert (acc.encode("utf-16-le") in res.data) is (not written)
+        assert len(res.data) == len(src)

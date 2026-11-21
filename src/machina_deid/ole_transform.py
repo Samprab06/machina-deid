@@ -37,7 +37,19 @@ FMTID_SUMMARY = bytes.fromhex("e0859ff2f94f6810ab9108002b27b3d9")  # F29F85E0-4F
 PID_CODEPAGE, PID_AUTHOR, PID_LASTAUTHOR = 1, 4, 8
 VT_I2, VT_LPSTR, VT_LPWSTR = 0x02, 0x1E, 0x1F
 SEPS = frozenset("\\/@.")
-SKIP_STREAM_HINTS = ("preview", "thumbnail")  # never written; only reported
+SKIP_STREAM_HINTS = ("preview", "thumbnail")  # written only when not a real image container (see below)
+# Signatures of image containers whose bytes are compressed/checksummed: an in-place write could corrupt them,
+# so verified-looking hits inside such preview streams stay report-only.
+IMAGE_SIGNATURES = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"BM")
+
+
+def _protected_stream(path: str, blob: bytes) -> bool:
+    if not any(h in path.lower() for h in SKIP_STREAM_HINTS):
+        return False
+    if blob.startswith(IMAGE_SIGNATURES):
+        return True
+    # packed DIB (BITMAPINFOHEADER size 40/108/124 at offset 0)
+    return len(blob) >= 4 and int.from_bytes(blob[:4], "little") in (40, 108, 124)
 VERIFIED_KINDS = ("property", "cstring", "path_component", "lp_utf16", "lp_ansi")
 MIN_PATH_UNITS = 3  # shorter accounts are too ambiguous as bare path/contact tokens (CStrings stay exact)
 
@@ -422,6 +434,7 @@ def scan(cfb: Cfb, values: list[str], props: list[Prop] | None = None) -> list[H
     taken = {(h.stream, h.off) for h in hits}
     for e in cfb.streams():
         blob = cfb.read(e)
+        protected = _protected_stream(e.path, blob)
         for v in values:
             if not v:
                 continue
@@ -437,7 +450,7 @@ def scan(cfb: Cfb, values: list[str], props: list[Prop] | None = None) -> list[H
                     kind = "path_component"
                 else:
                     kind = "raw_utf16"
-                if kind != "raw_utf16" and any(h in e.path.lower() for h in SKIP_STREAM_HINTS):
+                if kind != "raw_utf16" and protected:
                     kind = "raw_utf16"
                 hits.append(Hit(e.path, kind, i, len(u), v, "utf-16-le"))
                 taken.add((e.path, i))
@@ -449,7 +462,7 @@ def scan(cfb: Cfb, values: list[str], props: list[Prop] | None = None) -> list[H
                 for i in _find_all(blob, a):
                     if (e.path, i) not in taken:
                         kind = "lp_ansi" if _len_prefixed(blob, i, len(a), 1) else "raw_ascii"
-                        if kind != "raw_ascii" and any(h in e.path.lower() for h in SKIP_STREAM_HINTS):
+                        if kind != "raw_ascii" and protected:
                             kind = "raw_ascii"
                         hits.append(Hit(e.path, kind, i, len(a), v, "cp1252"))
                         taken.add((e.path, i))
