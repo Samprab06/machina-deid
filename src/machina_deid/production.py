@@ -102,6 +102,11 @@ class Config:
     # Attempt 2+: reuse byte-identical outputs of a finished reference attempt via hardlinks (read only).
     reuse_from: str = ""
     repo_override: Path | None = None  # attempt 2+: separate checkout; never the live attempt's repo
+    # Optional physical-host guard (e.g. /mnt/e backing a WSL VHDX): the virtual ext4 free space can be far
+    # larger than what the host disk can still absorb. Checked before every submission; when free - in-flight
+    # worst case < minimum, submission stops, in-flight files drain, and the run exits resumable.
+    host_space_path: Path | None = None
+    host_min_free_bytes: int = 0
 
     @property
     def ref_corpus(self) -> Path | None:
@@ -207,6 +212,34 @@ def verified_input(input_root: Path, rel: str, size: int) -> Path | None:
 def require_space(cfg: Config) -> None:
     if shutil.disk_usage(cfg.root).free < cfg.reserve_bytes:
         raise RunnerError("workspace is below the free-space reserve")
+
+
+STORAGE_STOP = "storage-stop.json"
+
+
+def host_free_bytes(path: Path) -> int:
+    return shutil.disk_usage(path).free
+
+
+def worst_case_new_bytes(size: int) -> int:
+    """Upper estimate of host bytes one file can newly allocate before commit (staged copy or rebuilt
+    output, which may recompress larger), regardless of whether it ends up hardlinked."""
+    return size + size // 4 + 1024**2
+
+
+def host_space_shortfall(cfg: Config, inflight_bytes: int) -> dict | None:
+    """``None`` if the host guard is off or satisfied; else a redacted status (fail-safe on errors)."""
+    if cfg.host_space_path is None:
+        return None
+    try:
+        free = host_free_bytes(cfg.host_space_path)
+    except OSError as exc:
+        return {"reason": "host_path_unavailable", "error": type(exc).__name__,
+                "host_min_free_bytes": cfg.host_min_free_bytes, "inflight_reserve_bytes": inflight_bytes}
+    if free - inflight_bytes >= cfg.host_min_free_bytes:
+        return None
+    return {"reason": "host_free_below_minimum", "host_free_bytes": free,
+            "host_min_free_bytes": cfg.host_min_free_bytes, "inflight_reserve_bytes": inflight_bytes}
 
 
 def is_heavy(cfg: Config, row: manifest.Row) -> bool:
@@ -588,6 +621,8 @@ class _Committer:
     def __init__(self, cfg: Config, ledger):
         self.cfg, self.ledger, self.pending, self.new = cfg, ledger, 0, 0
         self.made_dirs: set[Path] = set()
+        self.bytes_written = self.bytes_linked = 0  # genuine new bytes vs reused reference inodes
+        self.storage_stop: dict | None = None
 
     def commit_result(self, row, r: dict) -> None:
         output = self.cfg.corpus / row.path
@@ -596,8 +631,10 @@ class _Committer:
             self.made_dirs.add(output.parent)
         if r.get("link"):
             link_reference(Path(r["link"]), output, r)
+            self.bytes_linked += r["size"]
         else:
             os.replace(r["stage"], output)
+            self.bytes_written += r["size"]
         fsync_dir(output.parent)
         self.ledger.execute("INSERT INTO output VALUES (?, ?, ?, ?)", (row.path, r["status"], r["size"], r["digest"]))
         self.ledger.execute("INSERT OR REPLACE INTO output_detail VALUES (?, ?, ?, ?, ?)",
@@ -613,6 +650,10 @@ class _Committer:
 
 
 class _Stop(Exception):
+    pass
+
+
+class _StorageStop(Exception):
     pass
 
 
@@ -672,10 +713,17 @@ def _run_pool(cfg: Config, todo, committer: _Committer, errors: Counter, workers
                     nxt = next(it, None)
                     if nxt is None:
                         break
+                if committer.storage_stop is not None:
+                    break  # no new submissions; drain in-flight work, then stop resumably
                 h = is_heavy(cfg, nxt)
                 if h and heavy_now >= cfg.heavy_slots:
                     break
                 require_space(cfg)
+                reserve = sum(worst_case_new_bytes(r.size) for r, _ in inflight.values())
+                short = host_space_shortfall(cfg, reserve + worst_case_new_bytes(nxt.size))
+                if short is not None:
+                    committer.storage_stop = short
+                    break
                 try:
                     fut = ex.submit(_transform_task, *args0, nxt.path, nxt.size, nxt.md5, cfg.verify_md5, crash,
                                     str(cfg.ref_corpus) if cfg.ref_corpus else "")
@@ -685,6 +733,8 @@ def _run_pool(cfg: Config, todo, committer: _Committer, errors: Counter, workers
                 heavy_now += h
                 nxt = None
             if not inflight:
+                if committer.storage_stop is not None:
+                    raise _StorageStop
                 return None
             finished, _ = wait(inflight, return_when=FIRST_COMPLETED)
             for fut in finished:
@@ -697,7 +747,12 @@ def _run_pool(cfg: Config, todo, committer: _Committer, errors: Counter, workers
         ex.shutdown(cancel_futures=True)
 
 
-def assemble(cfg: Config, rows, ledger) -> Counter:
+def assemble(cfg: Config, rows, ledger, session: dict | None = None) -> Counter:
+    """``session`` (if given) receives redacted byte accounting and any storage stop status."""
+    session = {} if session is None else session
+    stop_file = cfg.private / STORAGE_STOP
+    if stop_file.exists():
+        log("Resuming after a host storage stop: " + stop_file.read_text().strip())
     done = {p for (p,) in ledger.execute("SELECT path FROM output")}
     todo = [r for r in rows if r.path not in done]
     if cfg.staging.exists():
@@ -737,8 +792,19 @@ def assemble(cfg: Config, rows, ledger) -> Counter:
                         committer.commit_result(row, r)
     except _Stop:
         log("Stopping early as requested (resumable)")
+    except _StorageStop:
+        committer.flush()
+        rec = {**committer.storage_stop, "stopped": True, "outputs_this_session": committer.new,
+               "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        atomic_write(stop_file, json.dumps(rec, sort_keys=True) + "\n")
+        session["storage_stop"] = rec
+        log("Stopping: host storage guard (resumable after freeing space): " + json.dumps(rec, sort_keys=True))
     finally:
         committer.flush()
+        session["bytes_written"], session["bytes_linked"] = committer.bytes_written, committer.bytes_linked
+    if "storage_stop" not in session and stop_file.exists():
+        stop_file.unlink()  # this session ran to completion (or a requested stop) without hitting the guard
+        fsync_dir(cfg.private)
     return errors
 
 
@@ -846,13 +912,14 @@ def run(cfg: Config, *, script: Path | None = None, discovery_only: bool = False
             if ledger.execute("SELECT COUNT(*) FROM discovery").fetchone()[0] != len(rows):
                 raise RunnerError("discovery is incomplete; transformation needs the complete catalog")
             freeze_catalog(cfg, ledger)
-            errors = assemble(cfg, rows, ledger)
+            session: dict = {}
+            errors = assemble(cfg, rows, ledger, session)
             freeze_catalog(cfg, ledger)  # re-verify nothing touched the catalog
             remaining = len(rows) - ledger.execute("SELECT COUNT(*) FROM output").fetchone()[0]
             if errors:
                 log("Transform errors (not recorded, will retry on resume): " + json.dumps(dict(errors)))
             if remaining:
-                return {"phase": "transform", "remaining": remaining, "errors": dict(errors),
+                return {"phase": "transform", "remaining": remaining, "errors": dict(errors), "session": session,
                         **summarize(cfg, ledger)}
             if not package_output:
                 return {"phase": "transform", "remaining": 0, **summarize(cfg, ledger)}
@@ -1009,6 +1076,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--heavy-bytes", type=int, default=256 * 1024**2)
     p.add_argument("--heavy-slots", type=int, default=2)
     p.add_argument("--reserve-bytes", type=int, default=15 * 1024**3)
+    p.add_argument("--host-space-path", type=Path, default=None,
+                   help="physical host mount backing the workspace (e.g. /mnt/e for a WSL VHDX on E:)")
+    p.add_argument("--host-min-free-bytes", type=int, default=0,
+                   help="stop submitting (resumably) when host free minus in-flight worst case drops below this")
     p.add_argument("--poll-seconds", type=float, default=15.0)
     p.add_argument("--no-verify-md5", action="store_true")
     p.add_argument("--no-package", action="store_true")
@@ -1020,11 +1091,14 @@ def main(argv=None, script: Path | None = None) -> int:
     a = build_parser().parse_args(argv)
     if a.workers < 1 or a.workers > 64 or a.heavy_slots < 1 or a.batch_files < 1:
         raise SystemExit("workers must be 1..64; heavy-slots and batch-files must be >= 1")
+    if (a.host_space_path is None) != (a.host_min_free_bytes <= 0):
+        raise SystemExit("--host-space-path and a positive --host-min-free-bytes must be given together")
     cfg = Config(root=a.root, attempt=a.attempt, expected_rows=a.expected_rows, expected_revision=a.expected_revision,
                  workers=a.workers, discovery_workers=a.discovery_workers, batch_files=a.batch_files,
                  batch_bytes=a.batch_bytes, heavy_bytes=a.heavy_bytes, heavy_slots=a.heavy_slots,
                  reserve_bytes=a.reserve_bytes, poll_seconds=a.poll_seconds, verify_md5=not a.no_verify_md5,
-                 stop_after_outputs=a.stop_after_outputs, reuse_from=a.reuse_from, repo_override=a.repo)
+                 stop_after_outputs=a.stop_after_outputs, reuse_from=a.reuse_from, repo_override=a.repo,
+                 host_space_path=a.host_space_path, host_min_free_bytes=max(0, a.host_min_free_bytes))
     try:
         if a.command in ("run", "discover"):
             if not a.expected_revision:
