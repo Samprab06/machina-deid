@@ -194,12 +194,13 @@ class OleOutcome:
 class Scope:
     """Read-only pass-2 view of the frozen shared map (one per worker process)."""
 
-    def __init__(self, map_path: str | Path, secret: bytes, expect_digest: str):
+    def __init__(self, map_path: str | Path, secret: bytes, expect_digest: str, *, ocr: bool = False):
         from .pdf_entities import Resolver
         if not expect_digest:
             raise ValueError("the frozen entity-map digest is required")
         self.map_path, self._secret, self.digest = Path(map_path), bytes(secret), expect_digest
         self._alias_key = ole_alias_key(self._secret)
+        self.ocr = ocr
         Resolver(self._secret, self.map_path, expect_digest=expect_digest).close()  # fail fast
 
     def resolver(self, catalog_strings: dict[str, str] | None = None):
@@ -211,7 +212,7 @@ class Scope:
         from .pdf_scoped import transform_pdf_scoped
         r = self.resolver(catalog_strings)
         try:
-            return transform_pdf_scoped(src, dst, r, overwrite=True)
+            return transform_pdf_scoped(src, dst, r, overwrite=True, ocr=self.ocr)
         finally:
             r.close()
 
@@ -273,9 +274,9 @@ class Scope:
         return out
 
 
-def scope_from_state(private: Path, secret: bytes, digest: str) -> Scope | None:
+def scope_from_state(private: Path, secret: bytes, digest: str, ocr: bool = False) -> Scope | None:
     p = Path(private) / MAP_NAME
-    return Scope(p, secret, digest) if digest and p.exists() else None
+    return Scope(p, secret, digest, ocr=ocr) if digest and p.exists() else None
 
 
 def temp_workdir(parent: Path | None = None):

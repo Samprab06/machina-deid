@@ -507,14 +507,14 @@ SCOPE_KEY = "entity_map_digest"
 SCOPE_OFF = "disabled"
 
 
-def _init_transform_worker(catalog_path: str, seed_path: str, scope_digest: str = "") -> None:
+def _init_transform_worker(catalog_path: str, seed_path: str, scope_digest: str = "", scope_ocr: bool = False) -> None:
     global _CAT, _SCOPE
     from .catalog import IdentityCatalog
     seed = Path(seed_path).read_bytes()
     _CAT = IdentityCatalog(catalog_path, seed, read_only=True)
     if scope_digest and scope_digest != SCOPE_OFF:
         from .scope import scope_from_state
-        _SCOPE = scope_from_state(Path(seed_path).parent, seed, scope_digest)
+        _SCOPE = scope_from_state(Path(seed_path).parent, seed, scope_digest, ocr=scope_ocr)
         if _SCOPE is None:
             raise RunnerError("frozen entity map is missing")
 
@@ -528,13 +528,17 @@ def ensure_scope(cfg: Config, rows, ledger) -> str:
     pinned = meta_get(ledger, SCOPE_KEY)
     want_off = not cfg.scope
     if pinned is not None:
-        if (pinned == SCOPE_OFF) != want_off:
-            raise RunnerError("scope mode differs from the mode pinned for this attempt")
+        if (pinned == SCOPE_OFF) != want_off or (meta_get(ledger, "scope_ocr") or "0") != str(int(cfg.scope_ocr)):
+            raise RunnerError("scope/OCR mode differs from the mode pinned for this attempt")
         if pinned != SCOPE_OFF and not (cfg.private / MAP_NAME).exists():
             raise RunnerError("pinned entity map is missing")
         return pinned
     if ledger.execute("SELECT COUNT(*) FROM output").fetchone()[0]:
         raise RunnerError("outputs exist without a pinned scope mode; rerun with --no-scope or a new attempt")
+    if cfg.scope_ocr and not want_off:
+        from .pdf_ocr import available
+        if not available():
+            raise RunnerError("--scope-ocr needs Tesseract with tessdata (TESSDATA_PREFIX)")
     if want_off:
         digest = SCOPE_OFF
     else:
@@ -554,6 +558,7 @@ def ensure_scope(cfg: Config, rows, ledger) -> str:
         log("Scope frozen: " + json.dumps({k: v for k, v in stats.items() if k != "digest"}, sort_keys=True))
         digest = stats["digest"]
     ledger.execute("INSERT INTO runner_meta VALUES (?, ?)", (SCOPE_KEY, digest))
+    ledger.execute("INSERT INTO runner_meta VALUES ('scope_ocr', ?)", (str(int(cfg.scope_ocr and not want_off)),))
     ledger.commit()
     return digest
 
@@ -721,7 +726,8 @@ def _run_pool(cfg: Config, todo, committer: _Committer, errors: Counter, workers
     crash = os.environ.get(TEST_CRASH_ENV, "")
     seed = str(cfg.private / "seed")
     scope_digest = meta_get(committer.ledger, SCOPE_KEY) or ""
-    ex = pool(workers, cfg, _init_transform_worker, (str(cfg.catalog_path), seed, scope_digest))
+    scope_ocr = meta_get(committer.ledger, "scope_ocr") == "1"
+    ex = pool(workers, cfg, _init_transform_worker, (str(cfg.catalog_path), seed, scope_digest, scope_ocr))
     inflight: dict = {}
     heavy_now, it, nxt = 0, iter(todo), None
 
