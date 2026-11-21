@@ -37,6 +37,7 @@ _EXT = {
     ".idw": ("idw", "native_cad"),
     ".fcstd": ("fcstd", "native_cad"),
     ".stl": ("stl", "mesh"),
+    ".svg": ("svg", "vector"),  # attempt 2b: no short magic (XML); svg_meta validates the root element
 }
 
 _OLE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"

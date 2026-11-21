@@ -124,7 +124,8 @@ def test_end_to_end_checksums_and_redaction(tmp_path):
     st = d["by_format"]["step"]
     assert st["selected"] == 2 and st["readable"] == 2 and st["reused"] == 1 and st["downloaded"] == 1
     assert st["auto_eligible"] > 0 and st["review_required"] > 0 and st["confident_identities"] > 0
-    assert d["by_format"]["neutral_mesh"]["unsupported"] == 1
+    # attempt 2b: STL is now read for pass-2 header lookups (readable, never auto-approved)
+    assert d["by_format"]["neutral_mesh"]["unsupported"] == 0 and d["by_format"]["neutral_mesh"]["readable"] == 1
     assert isinstance(rep["transformation"], dict)
     public = (bench / "runs" / "r1" / "public-report.json").read_text()
     for raw in ("Jane Quincy Doe", "Other Person", "Acme Widgets", str(tmp_path), "local.step",

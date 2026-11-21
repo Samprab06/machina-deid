@@ -36,6 +36,7 @@ from .catalog import IdentityCatalog
 _CODE = re.compile(r"^[a-z0-9_:.\-]{1,80}$")
 _TYPE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 PILOT_EXTS = (".step", ".stp", ".zip", ".dxf", ".pdf")
+NEW_EXTS = (".svg", ".stl")  # attempt-1 unsupported_passthrough rows now read for pass-2 lookups
 
 
 def _code(s: str) -> str:
@@ -132,17 +133,20 @@ def _key(rel: str) -> str:
 
 def select_samples(ledger: sqlite3.Connection, per_ext: int, exts=PILOT_EXTS) -> dict[str, list[tuple]]:
     """``{"residual"|"control": [(rel, out_digest, old_residual, old_fields)]}`` deterministic by sha256(path)."""
-    rows = ledger.execute("SELECT o.path, o.digest, d.residual_approved, d.fields_replaced FROM output o "
-                          "JOIN output_detail d USING(path) WHERE o.status='transformed'").fetchall()
+    rows = ledger.execute("SELECT o.path, o.status, o.digest, d.residual_approved, d.fields_replaced FROM output o "
+                          "JOIN output_detail d USING(path) "
+                          "WHERE o.status IN ('transformed', 'unsupported_passthrough')").fetchall()
     groups: dict[tuple[str, str], list] = defaultdict(list)
-    for rel, dig, res, fields in rows:
+    for rel, status, dig, res, fields in rows:
         ext = PurePosixPath(rel).suffix.lower()
-        if ext in exts:
+        if status == "transformed" and ext in exts:
             groups[("residual" if res > 0 else "control", ext)].append((rel, dig, res, fields))
-    out: dict[str, list] = {"residual": [], "control": []}
+        elif status == "unsupported_passthrough" and ext in NEW_EXTS:
+            groups[("newly_supported", ext)].append((rel, dig, res, fields))
+    out: dict[str, list] = {"residual": [], "control": [], "newly_supported": []}
     for (cls, _), items in sorted(groups.items()):
         items.sort(key=lambda t: _key(t[0]))
-        out[cls] += items[: per_ext if cls == "residual" else max(1, per_ext // 4)]
+        out[cls] += items[: per_ext if cls != "control" else max(1, per_ext // 4)]
     return out
 
 

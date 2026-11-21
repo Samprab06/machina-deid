@@ -16,10 +16,27 @@ def ws(tmp_path_factory):
     for i in range(3):  # time_stamp hit: never edited -> a genuine residual-positive STEP row
         files[f"r/ts{i}.step"] = step_bytes(name=f"b{i}", author=f"('{PERSON}')", org=f"('{ORG}')",
                                             ts=f"{PERSON} {i}")
+    import struct
+    tri = struct.pack("<12fH", *([0.0] * 12), 0)
+    files["m/mesh.stl"] = f"Exported by {PERSON}".encode().ljust(80, b"\x00") + struct.pack("<I", 1) + tri
+    files["m/plain.stl"] = b"plain".ljust(80, b"\x00") + struct.pack("<I", 1) + tri
     files["r/pre.step"] = step_bytes(name="p", author=f"('{PERSON}')", org=f"('{ORG}')", preproc=f"{ORG} x")
     root = tmp_path_factory.mktemp("pilot")
     head = make_workspace(root, files)
     assert pr.run(cfg(root, head, len(files), "attempt-1"))["phase"] == "packaged"
+    # emulate the real attempt 1 for STL (unsupported_passthrough, byte-identical copy); synthetic fixture only
+    import hashlib
+    import sqlite3
+    db = sqlite3.connect(root / "ops/attempt-1/ledger.sqlite")
+    for rel in ("m/mesh.stl", "m/plain.stl"):
+        out = root / "attempts/attempt-1/corpus" / rel
+        out.chmod(0o644)
+        out.write_bytes(files[rel])
+        db.execute("UPDATE output SET status='unsupported_passthrough', digest=? WHERE path=?",
+                   (hashlib.sha256(files[rel]).hexdigest(), rel))
+        db.execute("UPDATE output_detail SET residual_approved=0, fields_replaced=0, fully_clean=0 WHERE path=?", (rel,))
+    db.commit()
+    db.close()
     pr.adopt(cfg(root, head, len(files), "attempt-2", reuse_from="attempt-1"), "attempt-1")
     return root
 
@@ -39,6 +56,8 @@ def test_pilot_counts_only_and_read_only(ws, tmp_path, capsys):
     attr = rep["classes"]["residual"][".step"]["input_attribution"]
     assert attr["header:timestamp"] == 3
     assert "control" in rep["classes"]
+    new = rep["classes"]["newly_supported"][".stl"]["counts"]
+    assert new["samples"] == 2 and new["new_status:transformed"] == 1 and new["new_fully_clean"] == 1
     # redaction: no values, pseudonyms, or paths
     for bad in (PERSON, ORG, "Doe", "Acme", "proj", "ts0", "pre.step", str(root)):
         assert bad not in text

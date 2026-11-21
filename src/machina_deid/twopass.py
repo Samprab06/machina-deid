@@ -29,7 +29,9 @@ from .discovery import Candidate, discover_dxf, discover_path, discover_pdf, dis
 from .idmap import IdentityMap
 from .transform_counts import TransformCounts
 
-SUPPORTED = ("pdf", "dxf", "step", "zip")
+SUPPORTED = ("pdf", "dxf", "step", "zip", "svg", "stl")
+PASS2_FORMATS = ("svg", "stl")  # attempt 2b: lookup of existing approvals only; never recorded in pass 1
+_META_KINDS = ("person", "org")
 _AUTO_LOCATIONS = re.compile(r"^(?:pdf:metadata\.author|step:FILE_NAME\.(?:author|organization)\[\d+\])$")
 _NEVER_AUTO = {"file_name", "project", "part", "description", "text_label_value", "path_component",
                "software_or_authorization", "timestamp", "org_name"}
@@ -74,7 +76,35 @@ def _discover_one(path: Path, fmt: str) -> list[Candidate]:
         return discover_dxf(path)
     if fmt == "step":
         return discover_step(path)
+    if fmt == "svg":
+        from .svg_meta import discover_svg
+        return discover_svg(path)
+    if fmt == "stl":
+        return discover_stl(path)
     raise ValueError("unsupported format")
+
+
+def discover_stl(path: Path) -> list[Candidate]:
+    """Boundary-delimited token spans of the STL header / solid names (pass-2 lookup candidates)."""
+    from . import stl_meta as sm
+    size = path.stat().st_size
+    with path.open("rb") as f:
+        head = f.read(84)
+    if len(head) == 84 and size == 84 + 50 * int.from_bytes(head[80:84], "little"):
+        h = sm.header_text(head)
+        texts = [h[0]] if h else []
+    elif size <= sm.MAX_ASCII_BYTES:
+        texts = sm.candidates(path.read_bytes())
+    else:
+        texts = []
+    out, seen = [], set()
+    for t in texts:
+        for a, b in sm.spans(t):
+            if t[a:b] not in seen:
+                seen.add(t[a:b])
+                out.append(Candidate("person_or_org", t[a:b], f"stl:header_text[{len(out)}]", "low",
+                                     "STL header/solid name span; pass-2 lookup of existing approvals only"))
+    return out
 
 
 def _member_fmt(name: str) -> str | None:
@@ -217,7 +247,7 @@ class BatchResult:
         return dict(self.__dict__)
 
 
-_PASS2_ONLY = re.compile(r"^step:DATA\.(?:PERSON\.|ORGANIZATION\.0)")
+_PASS2_ONLY = re.compile(r"^(?:step:DATA\.(?:PERSON\.|ORGANIZATION\.0)|svg:|stl:)")
 
 
 def is_pass2_only(c: Candidate) -> bool:
@@ -462,6 +492,66 @@ class TransformOutcome:
         return {**data, **self.replacement_counts()}
 
 
+def _meta_map(cat: IdentityCatalog, cands: list[Candidate]) -> dict[str, str]:
+    """Exact candidate string -> pseudonym, only for values approved as ``person``/``org``."""
+    vmap: dict[str, str] = {}
+    for c in cands:
+        if c.value in vmap:
+            continue
+        hit = cat.approved_pseudonym(c.value)
+        if hit is not None and hit[0] in _META_KINDS and hit[1] != c.value:
+            vmap[c.value] = hit[1]
+    return vmap
+
+
+def _transform_meta(cat, fmt, src: Path, dst: Path, cands, out, before: str, overwrite: bool):
+    """Attempt 2b SVG Dublin Core agents / STL header text. Residual = approved candidates rediscovered
+    in the written output (independent re-parse) plus, for SVG/ASCII STL, raw substring hits."""
+    vmap = _meta_map(cat, cands)
+    out.approved_values = len(vmap)
+    if not vmap:
+        out.status, out.reason = "no_approved_identities", "nothing approved for current candidates"
+        out.source_unchanged = _sha_file(src) == before
+        return out
+    ok = False
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if fmt == "svg":
+            from .svg_meta import transform_svg
+            r = transform_svg(src, dst, vmap, overwrite=overwrite)
+            n, attr = r.replacements, "svg_metadata_replacements"
+        else:
+            from .stl_meta import transform_stl
+            r = transform_stl(src, dst, vmap.get, overwrite=overwrite)
+            n, attr = r.replacements, "mesh_header_replacements"
+        ok = r.outcome == "transformed_validated"
+        if ok:
+            setattr(out.changes, attr, n)
+            again = _meta_map(cat, _discover_one(dst, fmt))
+            out.residual_approved = len(again)
+            if fmt == "svg" or getattr(r, "kind", "") == "ascii":
+                raw = dst.read_bytes()
+                left = sum(raw.count(k.encode("utf-8")) for k in vmap if k not in vmap.values())
+                if left:
+                    out.independent_residual[f"{fmt}_raw_substring"] = left
+        else:
+            out.reason = r.reason or r.outcome
+            if r.outcome == "inspected_no_identifiers":
+                out.status = "no_approved_identities"
+    except (OSError, ValueError) as exc:
+        ok, out.reason = False, f"transform_error:{type(exc).__name__}"
+    out.output_written = ok and dst.exists()
+    if not out.output_written:
+        out.changes = TransformCounts()
+    out.fields_replaced = out.changes.total
+    if out.status != "no_approved_identities":
+        out.status = "transformed" if ok else "failed"
+    out.source_unchanged = _sha_file(src) == before
+    out.fully_clean = (ok and out.output_written and out.residual_approved == 0
+                       and not any(out.independent_residual.values()))
+    return out
+
+
 def _sum(d: dict) -> int:
     return sum(d.values()) if d else 0
 
@@ -482,6 +572,8 @@ def transform_file(cat: IdentityCatalog, src: str | Path, dst: str | Path, rel_p
         out.reason = found[0].reason
         return out
     cands = [c for d in found for c in d.candidates]
+    if fmt in PASS2_FORMATS:
+        return _transform_meta(cat, fmt, src, dst, cands, out, before, overwrite)
     idmap, st = build_identity_map(cat, cands)
     org_map, org_other = build_org_map(cat, cands) if fmt in ("step", "zip") else ({}, 0)
     org_map_zip: dict[str, str] = {}
