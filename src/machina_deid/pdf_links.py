@@ -6,7 +6,7 @@ links whose destination has nothing to do with the edited value. The writer ther
 1. snapshots the page's link annotations (xref + object source) before redacting,
 2. re-attaches any link the redaction dropped (the *same* object, so action, border, flags and destination
    are untouched), and
-3. rewrites only URI / file-spec strings that contain an already-resolved scoped value (exact, boundary
+3. rewrites only URI actions that contain an already-resolved scoped value (exact, boundary
    delimited, also percent-encoded); every other link action stays byte-identical.
 
 :func:`verify_links` is the independent check: it compares the normalized link list of the source and the
@@ -57,20 +57,121 @@ def restore_links(doc, page, snap: list[tuple[int, str]], order_before: list[int
     return len(missing)
 
 
-def rewrite_uri(uri: str, sub) -> tuple[str, int]:
-    """Substitute resolved values in a URI string; percent-encoded occurrences are decoded first."""
-    new, n = sub(uri)
-    if n and not _contains(unquote(new), sub):
-        return new, n
-    dec = unquote(new)
-    new2, n2 = sub(dec)
-    if n2:
-        return quote(new2, safe=":/?#[]@!$&'()*+,;=~%"), n + n2
-    return new, n
+_SCHEME = re.compile(r"^(https?|mailto):", re.I)
+_WEB = re.compile(r"^(?:https?://)?(?P<host>www\.[a-z0-9.-]+|(?<=://)[a-z0-9.-]+)(?P<tail>[/?#].*)?$", re.I)
+_HOST = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", re.I)
+_URI_PART = re.compile(r"[^/?#&=;,]+")
+_PERCENT_RUN = re.compile(r"(?:%[0-9a-fA-F]{2})+")
+_MAILBOX = re.compile(r"[^\s@]+@[^\s@]+")
+_MAIL_BOUNDARY = r"[\w.%+@-]"
 
 
-def _contains(s: str, sub) -> bool:
-    return bool(sub.rx and sub.rx.search(s))
+def _uri_text(value: str) -> str:
+    """Recognize a slash-prefixed spelling, including a PDF name's leading slash."""
+    return value[1:] if value.startswith("/") and _SCHEME.match(value[1:]) else value
+
+
+def _token_pattern(value: str) -> str:
+    boundary = _MAIL_BOUNDARY if _MAILBOX.fullmatch(value) else r"[^\W_]"
+    return rf"(?<!{boundary})" + r"\s+".join(map(re.escape, value.split())) + rf"(?!{boundary})"
+
+
+def _decoded_spans(raw: str) -> tuple[str, list[int]]:
+    """Map decoded character boundaries to raw offsets, leaving invalid UTF-8 escaped."""
+    chars, offsets = [], [0]
+    pos = 0
+    for match in _PERCENT_RUN.finditer(raw):
+        chars.append(raw[pos:match.start()])
+        offsets.extend(range(pos + 1, match.start() + 1))
+        try:
+            decoded = unquote(match[0], errors="strict")
+        except UnicodeDecodeError:
+            decoded = match[0]
+        stride = 1 if decoded == match[0] else 3
+        pos = match.start()
+        for char in decoded:
+            pos += stride * len(char.encode("utf-8"))
+            offsets.append(pos)
+        chars.append(decoded)
+    chars.append(raw[pos:])
+    offsets.extend(range(pos + 1, len(raw) + 1))
+    return "".join(chars), offsets
+
+
+def _rewrite_tokens(raw: str, pattern, replacements) -> tuple[str, int]:
+    decoded, offsets = _decoded_spans(raw)
+    n = 0
+    pieces = []
+    pos = 0
+    for match in pattern.finditer(decoded):
+        replacement = replacements.get(" ".join(match[0].split()).casefold())
+        if replacement is None:
+            continue
+        start, end = offsets[match.start()], offsets[match.end()]
+        # Keep an encoded mailbox separator encoded. Leave all untouched raw spans intact.
+        safe = "@" if "@" in raw[start:end] else ""
+        pieces.extend((raw[pos:start], quote(replacement, safe=safe)))
+        pos = end
+        n += 1
+    return "".join((*pieces, raw[pos:])), n
+
+
+def _web_tail_matches(tail: str, approved: str) -> bool:
+    # The visible match may end before a query/fragment or at a path prefix.
+    # Compare spelling without decoding structural escapes such as %2F into /.
+    escape_case = lambda s: _PERCENT_RUN.sub(lambda m: m[0].upper(), s)
+    tail, approved = escape_case(tail), escape_case(approved)
+    return tail == approved or (
+        tail.startswith(approved) and (approved.endswith("/") or tail[len(approved)] in "/?#&")
+    )
+
+
+class _UriRewrite:
+    def __init__(self, pairs):
+        self.web = []
+        self.tokens = {}
+        for old, new in pairs:
+            web = _WEB.fullmatch(old)
+            if web and _HOST.fullmatch(new):
+                self.web.append((web["host"].casefold(), web["tail"] or "", new))
+            elif old.strip():
+                self.tokens[" ".join(old.split()).casefold()] = new
+        patterns = [_token_pattern(v) for v in sorted(self.tokens, key=len, reverse=True)]
+        self.pattern = re.compile("|".join(patterns), re.I) if patterns else None
+
+    def __call__(self, raw: str) -> tuple[str, int]:
+        uri = _uri_text(raw)
+        scheme = _SCHEME.match(uri)
+        if not scheme:
+            return raw, 0
+        prefix, body = scheme[0], uri[scheme.end():]
+        n = 0
+        if prefix.casefold() != "mailto:":
+            # Preserve authority delimiters, user info, port and the complete request target.
+            authority = re.match(r"//(?:[^/?#]*@)?([^:/?#]+)(?::[0-9]+)?(?=[/?#]|$)", body)
+            if not authority:
+                return raw, 0
+            host = authority[1].casefold()
+            tail = body[authority.end():]
+            for old, path, new in self.web:
+                if host == old and (not path or _web_tail_matches(tail, path)):
+                    start, end = authority.span(1)
+                    prefix += body[:start] + new + body[end:authority.end()]
+                    n += 1
+                    break
+            else:
+                prefix += authority[0]
+            body = tail
+
+        def replace(match):
+            nonlocal n
+            result, count = _rewrite_tokens(match[0], self.pattern, self.tokens)
+            n += count
+            return result
+
+        if self.pattern:
+            body = _URI_PART.sub(replace, body)
+        return (prefix + body, n) if n else (raw, 0)
 
 
 def _action_target(doc, xref: int) -> tuple[int, str]:
@@ -83,24 +184,47 @@ def _action_target(doc, xref: int) -> tuple[int, str]:
     return 0, ""
 
 
+def _uri_action(doc, xref):
+    ax, pre = _action_target(doc, xref)
+    if ax and doc.xref_get_key(ax, pre + "S") == ("name", "/URI"):
+        return ax, pre, *doc.xref_get_key(ax, pre + "URI")
+    return 0, "", "null", ""
+
+
+def _nested_action(doc, xref):
+    ax, pre = _action_target(doc, xref)
+    return (doc.xref_get_key(xref, "AA")[0] != "null"
+            or (ax and doc.xref_get_key(ax, pre + "Next")[0] != "null"))
+
+
+def raw_link_uri(doc, xref: int) -> str:
+    """Read the PDF action value even when MuPDF exposes no interpreted URI."""
+    _, _, typ, val = _uri_action(doc, xref)
+    return val if typ in ("string", "name") else ""
+
+
 def rewrite_link_actions(doc, sub) -> int:
-    """Rewrite /URI and string /F of every link action that contains a resolved value."""
+    """Rewrite simple URI actions on the restored annotation list."""
+    rewrite = _UriRewrite(sub.pairs)
     n_total = 0
     for page in doc:
-        for x, t, _ in page.annot_xrefs():
-            if t != _LINK:
+        for xref, kind, _ in page.annot_xrefs():
+            if kind != _LINK or _nested_action(doc, xref):
                 continue
-            ax, pre = _action_target(doc, x)
-            if not ax:
+            ax, pre, typ, val = _uri_action(doc, xref)
+            if typ not in ("string", "name"):
                 continue
-            for key in ("URI", "F"):
-                typ, val = doc.xref_get_key(ax, pre + key)
-                if typ != "string" or not val:
-                    continue
-                new, n = rewrite_uri(val, sub)
-                if n and new != val:
-                    doc.xref_set_key(ax, pre + key, pymupdf.get_pdf_str(new))
-                    n_total += n
+            new, n = rewrite(val)
+            if not n or new == val:
+                continue
+            if not pre:
+                # An indirect action can also be used by another PDF object.
+                clone = doc.get_new_xref()
+                doc.update_object(clone, doc.xref_object(ax))
+                doc.xref_set_key(xref, "A", f"{clone} 0 R")
+                ax = clone
+            doc.xref_set_key(ax, pre + "URI", pymupdf.get_pdf_str(new))
+            n_total += n
     return n_total
 
 
@@ -112,24 +236,44 @@ def _r(v) -> tuple:
 
 
 def _norm_links(page) -> list[dict]:
+    interpreted = {ln["xref"]: ln for ln in page.get_links() if ln["xref"] > 0}
     out = []
-    for ln in page.get_links():
-        out.append({"kind": ln.get("kind"), "rect": _r(ln.get("from")), "page": ln.get("page", -1),
-                    "to": _r(ln.get("to")) if ln.get("to") is not None else (),
-                    "nameddest": str(ln.get("nameddest") or ""), "uri": str(ln.get("uri") or ""),
-                    "file": str(ln.get("file") or "")})
+    doc = page.parent
+    for xref, kind, _ in page.annot_xrefs():
+        if kind != _LINK:
+            continue
+        ln = interpreted.pop(xref, {})
+        typ, rect = doc.xref_get_key(xref, "Rect")
+        raw = raw_link_uri(doc, xref)
+        out.append({"kind": ln.get("kind"), "rect": rect,
+                    "hot_area": _r(ln.get("from")), "page": ln.get("page", -1),
+                    "to": _r(ln.get("to")), "nameddest": str(ln.get("nameddest") or ""),
+                    "uri": str(ln.get("uri") or ""), "file": str(ln.get("file") or ""),
+                    "raw": raw, "nested": _nested_action(doc, xref)})
     return out
 
 
 class _ValueCheck:
-    """Case-insensitive, boundary-free containment check of resolved values (raw and percent-decoded)."""
+    """Check for exact approved tokens independently of the replacement routine."""
 
     def __init__(self, values):
-        self.vals = [re.sub(r"\s+", "", v.casefold()) for v in values if v.strip()]
+        self.patterns = [re.compile(_token_pattern(v.strip()), re.I) for v in values if v.strip()]
+        self.web = [m for v in values if (m := _WEB.fullmatch(v))]
 
-    def __call__(self, s: str) -> bool:
-        flat = re.sub(r"\s+", "", (s + "\n" + unquote(s)).casefold())
-        return any(v in flat for v in self.vals)
+    def __call__(self, value: str) -> bool:
+        uri = _uri_text(value)
+        for spelling in (uri, unquote(uri)):
+            if any(pattern.search(spelling) for pattern in self.patterns):
+                return True
+        try:
+            parsed = urlsplit(uri)
+        except ValueError:
+            return False
+        if parsed.scheme.lower() not in ("http", "https"):
+            return False
+        tail = re.split(r"://[^/?#]*", uri, maxsplit=1)[-1]
+        return any(parsed.hostname == m["host"].casefold()
+                   and (not m["tail"] or _web_tail_matches(tail, m["tail"])) for m in self.web)
 
 
 def verify_links(src_doc, out_doc, values) -> Counter:
@@ -137,48 +281,39 @@ def verify_links(src_doc, out_doc, values) -> Counter:
     bad: Counter = Counter()
     has = _ValueCheck(values)
     for pno in range(src_doc.page_count):
-        before = sorted(_norm_links(src_doc[pno]), key=lambda d: (d["kind"], d["rect"], d["uri"]))
-        after = sorted(_norm_links(out_doc[pno]), key=lambda d: (d["kind"], d["rect"], d["uri"]))
+        before, after = _norm_links(src_doc[pno]), _norm_links(out_doc[pno])
         if len(before) != len(after):
             bad["link_count_changed"] += 1
             continue
-        geo_a = Counter((d["kind"], d["rect"]) for d in before)
-        geo_b = Counter((d["kind"], d["rect"]) for d in after)
-        if geo_a != geo_b:
+        if Counter(d["rect"] for d in before) != Counter(d["rect"] for d in after):
             bad["link_geometry_changed"] += 1
             continue
-        # pair links by (kind, rect); within equal geometry compare as multisets
-        groups_a, groups_b = {}, {}
-        for d in before:
-            groups_a.setdefault((d["kind"], d["rect"]), []).append(d)
-        for d in after:
-            groups_b.setdefault((d["kind"], d["rect"]), []).append(d)
-        for k, la in groups_a.items():
-            lb = list(groups_b[k])
-            for a in la:
-                match = None
-                for b in lb:
-                    if _same_action(a, b, has):
-                        match = b
-                        break
-                if match is None:
-                    bad["link_action_changed"] += 1
-                else:
-                    lb.remove(match)
+        if has.patterns and any(d["nested"] for d in before + after):
+            bad["link_nested_action_unsupported"] += 1
+        remaining = list(after)
+        for a in before:
+            for i, b in enumerate(remaining):
+                if a["rect"] == b["rect"] and _same_action(a, b, has):
+                    remaining.pop(i)
+                    break
+            else:
+                bad["link_action_changed"] += 1
     return bad
 
 
 def _same_action(a: dict, b: dict, has) -> bool:
-    for k in ("page", "to", "nameddest"):
-        if a[k] != b[k]:
+    if has(a["raw"]):
+        old_scheme = _SCHEME.match(_uri_text(a["raw"]))
+        new_scheme = _SCHEME.match(b["raw"])
+        if not old_scheme or not new_scheme or old_scheme[0].casefold() != new_scheme[0].casefold():
             return False
-    for k in ("uri", "file"):
-        if not has(a[k]):
-            if a[k] != b[k]:
-                return False  # untouched destination must be identical
-        else:
-            if has(b[k]) or not b[k]:
-                return False  # identity left in the destination, or destination lost
-            if urlsplit(a[k]).scheme.lower() != urlsplit(b[k]).scheme.lower():
-                return False
-    return True
+        if b["kind"] != pymupdf.LINK_URI or not b["uri"] or has(b["raw"]) or has(b["uri"]):
+            return False
+        try:
+            parsed = urlsplit(b["raw"])
+        except ValueError:
+            return False
+        if parsed.scheme.lower() in ("http", "https") and not parsed.hostname:
+            return False
+        return a["hot_area"] == b["hot_area"] or not a["hot_area"]
+    return a == b and not any(has(b[k]) for k in ("uri", "file", "nameddest"))
