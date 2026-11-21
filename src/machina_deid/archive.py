@@ -186,10 +186,42 @@ def _is_symlink(info: zipfile.ZipInfo) -> bool:
 
 # ------------------------------------------------------------------ member transforms
 
+SCAN_ENCODINGS = ("utf-8", "cp1252", "utf-16-le")
+
+
+def scan_encodings(value: str) -> dict[str, bytes]:
+    """Distinct, *strict*, non-empty byte encodings of ``value`` (an encoding that cannot represent
+    the whole value is skipped: searching a degraded/empty byte string is not a match for the value)."""
+    out: dict[str, bytes] = {}
+    for enc in SCAN_ENCODINGS:
+        try:
+            b = value.encode(enc)
+        except UnicodeEncodeError:
+            continue
+        if b and b not in out.values():
+            out[enc] = b
+    return out
+
+
 def _scan(data: bytes, idmap: IdentityMap) -> dict[int, int]:
+    """Exact raw occurrences per identity index: max over the value's strict encodings (no double
+    counting across encodings of the same value). Overlap between *different* values is not removed
+    here (conservative); ``zip_diagnostic`` reports it separately."""
     out: dict[int, int] = {}
     for i, old in enumerate(idmap.strings):
-        n = max(data.count(old.encode(enc, "ignore")) for enc in ("utf-8", "cp1252", "utf-16-le"))
+        n = max((data.count(b) for b in scan_encodings(old).values()), default=0)
+        if n:
+            out[i] = n
+    return out
+
+
+def _scan_legacy(data: bytes, idmap: IdentityMap) -> dict[int, int]:
+    """Attempt-1 / pre-fix semantics (``errors='ignore'``), kept only so diagnostics can reproduce the
+    old exact metric. An unencodable value degraded to a shorter or empty needle (b"" matches
+    ``len(data)+1`` times)."""
+    out: dict[int, int] = {}
+    for i, old in enumerate(idmap.strings):
+        n = max(data.count(old.encode(enc, "ignore")) for enc in SCAN_ENCODINGS)
         if n:
             out[i] = n
     return out

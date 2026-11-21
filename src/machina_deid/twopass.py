@@ -372,6 +372,15 @@ def build_org_map(cat: IdentityCatalog, candidates: list[Candidate]) -> tuple[di
     return out, other
 
 
+def zip_member_map(cat: IdentityCatalog, cands: list[Candidate]) -> tuple[IdentityMap, set[str], int]:
+    """The single member map ``transform_file`` hands to ``archive.transform_zip``:
+    ``(map, values that entered only via DATA person/org positions, approved count)``."""
+    idmap, st = build_identity_map(cat, cands)
+    org_map, _ = build_org_map(cat, cands)
+    extra = {k: v for k, v in org_map.items() if k not in idmap.strings}
+    return IdentityMap(strings={**extra, **idmap.strings}), set(extra), st.approved_values + len(extra)
+
+
 def _transform_step(src: Path, dst: Path, idmap: IdentityMap, org_map: dict[str, str], out, overwrite: bool):
     """Header stage (FILE_NAME, untyped map) then DATA stage (ORGANIZATION.name, typed org map)."""
     from .step_data_transform import transform_descriptive
@@ -608,8 +617,7 @@ def transform_file(cat: IdentityCatalog, src: str | Path, dst: str | Path, rel_p
                 if left > 0:
                     out.independent_residual["step_data_literal_substring"] = left
         else:
-            if org_map_zip:
-                idmap = IdentityMap(strings={**org_map_zip, **idmap.strings})
+            idmap = zip_member_map(cat, cands)[0]
             r = ar.transform_zip(src, dst, idmap, overwrite=overwrite)
             ok = r.ok
             flat = list(ar._walk(r.members))
