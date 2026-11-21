@@ -3,7 +3,7 @@ import sqlite3
 
 import pytest
 
-from machina_deid.catalog import CatalogError, IdentityCatalog, Observation
+from machina_deid.catalog import SCHEMA_VERSION, CatalogError, IdentityCatalog, Observation
 from machina_deid.discovery import Candidate
 from machina_deid.identity import PseudonymMapper
 
@@ -51,7 +51,7 @@ def test_restart_persistence_and_resume(tmp_path):
         assert c.lookup("person", "jane doe") == p
         assert c.record([obs("Jane Doe"), obs("Jane Doe", h=H2)], confirmed=True) == 1
         assert c.report()["summary"]["observations"] == 2
-        assert sqlite3.connect(db).execute("PRAGMA user_version").fetchone()[0] == 1
+        assert sqlite3.connect(db).execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
 
 def test_secret_mismatch_rejected(tmp_path):

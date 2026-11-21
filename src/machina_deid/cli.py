@@ -1,4 +1,4 @@
-"""Command line: ``python -m machina_deid <report|state|pdf|dxf> ...``.
+"""Command line: ``python -m machina_deid <report|state|pdf|dxf|step|process|catalog|transfer> ...``.
 
 No command here uploads, submits or deletes anything. Outputs must be written to
 paths different from the source.
@@ -137,6 +137,67 @@ def cmd_transfer(a) -> int:
     return 0
 
 
+def _open_catalog(a):
+    from .catalog import IdentityCatalog
+    from .identity import load_secret
+    return IdentityCatalog(a.catalog, load_secret(a.secret_file))
+
+
+def cmd_catalog(a) -> int:
+    """Two-pass workflow. Raw values are read from stdin (never argv) and never printed."""
+    from . import twopass as tp
+    from .catalog import CatalogError
+    from .identity import IdentityError
+    try:
+        cat = _open_catalog(a)
+    except (CatalogError, IdentityError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        if a.action == "discover":
+            if not a.paths:
+                raise SystemExit("discover requires one or more paths")
+            root = Path(a.source_root).resolve() if a.source_root else None
+            items = []
+            for p in a.paths:
+                phys = Path(p).resolve()
+                rel = str(phys.relative_to(root)) if root and phys.is_relative_to(root) else phys.name
+                items.append((phys, rel))
+            res = tp.discover_batch(cat, items, limit=a.limit,
+                                    max_bytes=mf.parse_size(a.max_bytes) if a.max_bytes else None,
+                                    auto=not a.no_auto)
+            print(json.dumps(res.to_dict(), indent=2, sort_keys=True))
+        elif a.action == "report":
+            print(json.dumps(cat.report(), indent=2, sort_keys=True))
+        elif a.action in ("approve", "reject", "review"):
+            status = {"approve": "approved", "reject": "rejected", "review": "review"}[a.action]
+            vals = [ln.rstrip("\r\n") for ln in sys.stdin if ln.strip()]
+            out = {}
+            for v in vals:
+                r = cat.decide(a.kind, v, status, reason=a.reason or f"manual {a.action}")
+                out[r] = out.get(r, 0) + 1
+            print(json.dumps({"values": len(vals), "results": out}, sort_keys=True))
+            return 0 if set(out) <= {status} else 1
+        elif a.action == "alias":
+            vals = [ln.rstrip("\r\n") for ln in sys.stdin if ln.strip()]
+            if len(vals) != 2:
+                raise SystemExit("alias expects exactly two stdin lines: canonical, alias")
+            p = cat.approve_alias(a.kind, vals[0], vals[1], reason=a.reason or "manual alias approval")
+            print(json.dumps({"pseudonym": p}))
+        elif a.action == "transform":
+            if len(a.paths) != 2:
+                raise SystemExit("transform expects INPUT OUTPUT")
+            res = tp.transform_file(cat, a.paths[0], a.paths[1], overwrite=a.overwrite)
+            print(json.dumps(res.to_dict(), indent=2, sort_keys=True))
+            return 0 if res.status in ("transformed", "no_approved_identities") else 1
+    except CatalogError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        cat.close()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="machina_deid")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -193,6 +254,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--retry-failed", action="store_true")
     p.add_argument("--dry-run", action="store_true", help="classify/hash and report the plan; write nothing")
     p.set_defaults(fn=cmd_process)
+
+    c = sub.add_parser("catalog", help="two-pass workflow: discover -> report/approve -> transform")
+    c.add_argument("action", choices=["discover", "report", "approve", "reject", "review", "alias", "transform"])
+    c.add_argument("paths", nargs="*", help="discover: files; transform: INPUT OUTPUT")
+    c.add_argument("--catalog", required=True, help="catalog sqlite path (private)")
+    c.add_argument("--secret-file", help="HMAC secret file (else $MACHINA_DEID_SECRET)")
+    c.add_argument("--source-root", help="discover: make recorded paths relative to this root")
+    c.add_argument("--limit", type=int, default=100, help="discover: max files (hard cap 5000)")
+    c.add_argument("--max-bytes", help="discover: max source bytes")
+    c.add_argument("--no-auto", action="store_true", help="discover: record candidates only")
+    c.add_argument("--kind", default="text", help="approve/reject/review/alias identity kind")
+    c.add_argument("--reason", help="short ASCII reason (must not contain the value)")
+    c.add_argument("--overwrite", action="store_true")
+    c.set_defaults(fn=cmd_catalog)
 
     x = sub.add_parser("transfer", help="print (or with --execute run) a resumable rsync/SSH push")
     x.add_argument("--local-dir", required=True)

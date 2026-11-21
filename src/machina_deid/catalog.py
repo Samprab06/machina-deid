@@ -34,7 +34,9 @@ from typing import Iterable, Iterator
 from .discovery import CONFIDENCES
 from .identity import KINDS, IdentityError, PseudonymMapper, _normalize
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+APPROVAL_STATUSES = ("approved", "rejected", "review", "conflict")
+DECISION_SOURCES = ("manual", "auto")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_TEXT = re.compile(r"^[\x20-\x7e]{1,200}$")
 
@@ -61,6 +63,16 @@ _MIGRATIONS: dict[int, list[str]] = {
         """CREATE TABLE conflicts (
             conflict_key TEXT PRIMARY KEY, type TEXT NOT NULL, subject TEXT NOT NULL,
             other TEXT NOT NULL, detail TEXT NOT NULL)""",
+    ],
+    # Phase 5C: explicit approval state per exact (kind, normalized identity) key + decision log.
+    2: [
+        """CREATE TABLE approvals (
+            id_key TEXT PRIMARY KEY, kind TEXT NOT NULL, value_key TEXT NOT NULL,
+            status TEXT NOT NULL, source TEXT NOT NULL, reason TEXT NOT NULL)""",
+        "CREATE INDEX approvals_value ON approvals(value_key, status)",
+        """CREATE TABLE decisions (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT, decision_key TEXT NOT NULL UNIQUE, id_key TEXT NOT NULL,
+            kind TEXT NOT NULL, status TEXT NOT NULL, source TEXT NOT NULL, reason TEXT NOT NULL)""",
     ],
 }
 
@@ -306,6 +318,126 @@ class IdentityCatalog:
             raise CatalogError(error)
         return pseud
 
+    # ------------------------------------------------------------ approvals (Phase 5C)
+
+    def _check_reason(self, reason: str, value: str | None = None) -> None:
+        if not isinstance(reason, str) or not _SAFE_TEXT.fullmatch(reason):
+            raise CatalogError("reason must be short printable ASCII")
+        if value is not None:
+            norm = _normalize(value)
+            if len(norm) >= 3 and norm in _normalize(reason):
+                raise CatalogError("reason must not contain the identity value")
+
+    def decide(self, kind: str, value: str, status: str, *, reason: str, source: str = "manual") -> str:
+        """Record an explicit decision for the exact ``(kind, normalized value)`` key; returns the
+        resulting status.
+
+        * Only the exact value supplied is affected (no fuzzy/related values).
+        * ``approved`` allocates the deterministic pseudonym. A value may be approved under only one
+          kind; approving it under a second kind records a ``kind_conflict`` and the new key becomes
+          ``conflict`` (the existing approval is kept). Returned status is then ``conflict``.
+        * ``source="auto"`` never overrides an existing decision (manual or auto) for the key, and never
+          approves a value that has a manual rejection/conflict under any kind.
+        * Re-deciding the same status is idempotent (no new decision row).
+        """
+        self._check_kind(kind)
+        if status not in APPROVAL_STATUSES:
+            raise CatalogError(f"status must be one of {APPROVAL_STATUSES}")
+        if source not in DECISION_SOURCES:
+            raise CatalogError(f"source must be one of {DECISION_SOURCES}")
+        self._norm(value)
+        self._check_reason(reason, value)
+        id_key, vkey = self.identity_key(kind, value), self.value_key(value)
+        with self._tx() as db:
+            row = db.execute("SELECT status, source FROM approvals WHERE id_key=?", (id_key,)).fetchone()
+            if source == "auto":
+                if row is not None:
+                    return row[0]
+                if status == "approved" and db.execute(
+                        "SELECT 1 FROM approvals WHERE value_key=? AND status IN ('rejected','conflict')",
+                        (vkey,)).fetchone():
+                    status, reason = "review", "auto approval blocked by existing rejection/conflict"
+            if row is not None and row[0] == status and row[1] == source:
+                return status
+            if status == "approved":
+                other = db.execute("SELECT id_key FROM approvals WHERE value_key=? AND status='approved' "
+                                   "AND id_key<>?", (vkey, id_key)).fetchone()
+                if other is not None:
+                    self._conflict(db, "kind_conflict", id_key, other[0], "value already approved under another kind")
+                    status, reason = "conflict", "value already approved under another kind"
+                else:
+                    self._ensure_identity(db, kind, value)
+            db.execute("INSERT INTO approvals VALUES (?,?,?,?,?,?) ON CONFLICT(id_key) DO UPDATE SET "
+                       "status=excluded.status, source=excluded.source, reason=excluded.reason",
+                       (id_key, kind, vkey, status, source, reason))
+            n = db.execute("SELECT COUNT(*) FROM decisions WHERE id_key=?", (id_key,)).fetchone()[0]
+            dkey = self._hmac("machina-deid/catalog/decision", id_key, status, source, reason, str(n))
+            db.execute("INSERT OR IGNORE INTO decisions (decision_key, id_key, kind, status, source, reason) "
+                       "VALUES (?,?,?,?,?,?)", (dkey, id_key, kind, status, source, reason))
+            return status
+
+    def approve(self, kind: str, value: str, *, reason: str = "manual approval", source: str = "manual") -> str:
+        return self.decide(kind, value, "approved", reason=reason, source=source)
+
+    def reject(self, kind: str, value: str, *, reason: str = "manual rejection") -> str:
+        return self.decide(kind, value, "rejected", reason=reason)
+
+    def mark_review(self, kind: str, value: str, *, reason: str = "needs review", source: str = "manual") -> str:
+        return self.decide(kind, value, "review", reason=reason, source=source)
+
+    def approve_alias(self, kind: str, canonical: str, alias: str, *, reason: str = "manual alias approval") -> str:
+        """Explicitly link two exact values (see :meth:`assert_alias`) and approve both. Returns the
+        canonical pseudonym. Contradictory links raise :class:`CatalogError` and approve nothing."""
+        self._check_reason(reason, canonical)
+        self._check_reason(reason, alias)
+        pseud = self.assert_alias(kind, canonical, alias)
+        for v in (canonical, alias):
+            if self.approve(kind, v, reason=reason) != "approved":
+                raise CatalogError("alias value could not be approved (conflict recorded)")
+        return pseud
+
+    def approval_status(self, kind: str, value: str) -> str | None:
+        row = self._db.execute("SELECT status FROM approvals WHERE id_key=?",
+                               (self.identity_key(kind, value),)).fetchone()
+        return row[0] if row else None
+
+    def approved_pseudonym(self, value: str, kind: str | None = None) -> tuple[str, str] | None:
+        """Present a raw current candidate value; return ``(kind, pseudonym)`` if this exact normalized
+        value is approved (following explicit aliases), else None. Never registers anything."""
+        try:
+            vkey = self.value_key(value)
+        except CatalogError:
+            return None
+        rows = self._db.execute("SELECT id_key, kind FROM approvals WHERE value_key=? AND status='approved'",
+                                (vkey,)).fetchall()
+        if kind is not None:
+            rows = [r for r in rows if r[1] == kind]
+        if len(rows) != 1:
+            return None
+        root = self._root(self._db, rows[0][0])
+        return rows[0][1], self._db.execute("SELECT pseudonym FROM identities WHERE id_key=?", (root,)).fetchone()[0]
+
+    def value_decided(self, value: str) -> set[str]:
+        """Statuses recorded for this exact value under any kind."""
+        try:
+            vkey = self.value_key(value)
+        except CatalogError:
+            return set()
+        return {r[0] for r in self._db.execute("SELECT status FROM approvals WHERE value_key=?", (vkey,))}
+
+    def approvals_report(self) -> dict:
+        db, s = self._db, (lambda k: k[:16])
+        counts = {st: 0 for st in APPROVAL_STATUSES}
+        items = []
+        for k, kind, st, src, reason in db.execute(
+                "SELECT id_key, kind, status, source, reason FROM approvals ORDER BY id_key"):
+            counts[st] += 1
+            p = db.execute("SELECT pseudonym FROM identities WHERE id_key=?", (self._root(db, k),)).fetchone()
+            items.append({"id": s(k), "kind": kind, "status": st, "source": src, "reason": reason,
+                          "pseudonym": p[0] if p and st == "approved" else None})
+        n_dec = db.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
+        return {"counts": counts, "decisions": n_dec, "items": items}
+
     # ------------------------------------------------------------ reports
 
     def report(self) -> dict:
@@ -345,4 +477,5 @@ class IdentityCatalog:
             "unresolved_candidates": unresolved,
             "ambiguities": ambiguities,
             "conflicts": conflicts,
+            "approvals": self.approvals_report(),
         }
