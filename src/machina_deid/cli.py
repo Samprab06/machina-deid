@@ -140,6 +140,36 @@ def cmd_transfer(a) -> int:
     return 0
 
 
+def cmd_readiness(a) -> int:
+    from . import readiness as rd
+    if a.action == "report":
+        report = rd.new_report(a.manifest, a.output_root)
+        if a.out:
+            rd.write_checkpoint(report, a.out)
+        print(json.dumps({"manifest_rows": report["manifest_rows"],
+                          "malformed_manifest_lines": report["malformed_manifest_lines"],
+                          "duplicate_manifest_paths": report["duplicate_manifest_paths"],
+                          "duplicate_source_hashes": report["duplicate_source_hashes"],
+                          "out": str(a.out) if a.out else None}, indent=2, sort_keys=True))
+        return 0
+    if a.action == "checkpoint":
+        report = rd.read_checkpoint(a.checkpoint)
+        results = json.loads(Path(a.results).read_text(encoding="utf-8"))
+        if not isinstance(results, list):
+            raise SystemExit("results must be a JSON list")
+        print(json.dumps(rd.record_batch(report, results, a.checkpoint), indent=2, sort_keys=True))
+        return 0
+    if a.action == "validate":
+        report = rd.read_checkpoint(a.report) if a.report else None
+        result = rd.validate_final_layout(a.layout_root, a.manifest, report=report)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result["valid"] else 1
+    if a.action == "upload-plan":
+        print(json.dumps(rd.upload_plan(a.layout_root, a.destination), indent=2, sort_keys=True))
+        return 0
+    raise SystemExit(f"unknown readiness action: {a.action}")
+
+
 def _open_catalog(a):
     from .catalog import IdentityCatalog
     from .identity import load_secret
@@ -280,6 +310,18 @@ def main(argv: list[str] | None = None) -> int:
     x.add_argument("--bwlimit-kbps", type=int)
     x.add_argument("--execute", action="store_true")
     x.set_defaults(fn=cmd_transfer)
+
+    z = sub.add_parser("readiness", help="storage-independent full-corpus accounting and layout checks")
+    z.add_argument("action", choices=["report", "checkpoint", "validate", "upload-plan"])
+    z.add_argument("--manifest", help="full corpus manifest")
+    z.add_argument("--output-root", default="corpus", help="manifest-relative output root in the report")
+    z.add_argument("--out", help="write report/checkpoint JSON here")
+    z.add_argument("--checkpoint", help="existing checkpoint JSON")
+    z.add_argument("--results", help="JSON list of terminal row results")
+    z.add_argument("--layout-root", help="submission layout root")
+    z.add_argument("--report", help="checkpoint/report JSON for recorded output hashes")
+    z.add_argument("--destination", help="gs:// destination for upload-plan")
+    z.set_defaults(fn=cmd_readiness)
 
     a = ap.parse_args(argv)
     if a.cmd == "process" and not a.dry_run and not (a.output_root and a.work_dir):
