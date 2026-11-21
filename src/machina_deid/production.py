@@ -528,14 +528,51 @@ class _Stop(Exception):
     pass
 
 
-def _run_pool(cfg: Config, todo, committer: _Committer, errors: Counter, workers: int) -> list:
-    """Bounded, heavy-aware submission. Returns rows that were in flight when a worker died."""
+def _run_pool(cfg: Config, todo, committer: _Committer, errors: Counter, workers: int):
+    """Bounded, heavy-aware submission.
+
+    Returns None when ``todo`` is exhausted, else ``(suspects, rest)`` after the pool broke. The pool can
+    break at any moment (a worker dies), so BrokenProcessPool is handled both at ``submit`` and at
+    ``result``. Every input row ends up exactly once in: committed, an error count, ``suspects`` (was
+    submitted and may have killed a worker), or ``rest`` (never submitted). Futures that completed
+    successfully before the break are still committed, never re-run.
+    """
     args0 = (str(cfg.input), str(cfg.staging))
     crash = os.environ.get(TEST_CRASH_ENV, "")
     seed = str(cfg.private / "seed")
     ex = pool(workers, cfg, _init_transform_worker, (str(cfg.catalog_path), seed))
     inflight: dict = {}
     heavy_now, it, nxt = 0, iter(todo), None
+
+    def handle(row, fut) -> bool:
+        """Commit/record one finished future. False if it died with the pool."""
+        try:
+            r = fut.result()
+        except BrokenProcessPool:
+            return False
+        if "error" in r:
+            errors[r["error"]] += 1
+            return True
+        committer.commit_result(row, r)
+        if committer.new % 500 == 0:
+            log(f"Output checkpoint: +{committer.new:,} this session")
+        if cfg.stop_after_outputs and committer.new >= cfg.stop_after_outputs:
+            raise _Stop
+        return True
+
+    def broken():
+        lost = []
+        for fut, (row, _) in list(inflight.items()):
+            del inflight[fut]
+            if not (fut.done() and handle(row, fut)):
+                lost.append(row)
+        rest = ([] if nxt is None else [nxt]) + list(it)
+        if not lost and rest:
+            # Pool broke with nothing in flight (e.g. died at startup). Isolate the next row so the
+            # caller always makes progress instead of looping on a fresh pool forever.
+            lost, rest = rest[:1], rest[1:]
+        return lost, rest
+
     try:
         while True:
             while len(inflight) < workers * 2:
@@ -547,7 +584,10 @@ def _run_pool(cfg: Config, todo, committer: _Committer, errors: Counter, workers
                 if h and heavy_now >= cfg.heavy_slots:
                     break
                 require_space(cfg)
-                fut = ex.submit(_transform_task, *args0, nxt.path, nxt.size, nxt.md5, cfg.verify_md5, crash)
+                try:
+                    fut = ex.submit(_transform_task, *args0, nxt.path, nxt.size, nxt.md5, cfg.verify_md5, crash)
+                except BrokenProcessPool:
+                    return broken()  # nxt was not submitted: it stays in ``rest``
                 inflight[fut] = (nxt, h)
                 heavy_now += h
                 nxt = None
@@ -555,22 +595,11 @@ def _run_pool(cfg: Config, todo, committer: _Committer, errors: Counter, workers
                 return None
             finished, _ = wait(inflight, return_when=FIRST_COMPLETED)
             for fut in finished:
-                row, h = inflight.pop(fut)
+                row, h = inflight[fut]
+                if not handle(row, fut):
+                    return broken()
+                del inflight[fut]
                 heavy_now -= h
-                try:
-                    r = fut.result()
-                except BrokenProcessPool:
-                    lost = [row] + [rw for rw, _ in inflight.values()]
-                    rest = ([] if nxt is None else [nxt]) + list(it)
-                    return lost, rest
-                if "error" in r:
-                    errors[r["error"]] += 1
-                    continue
-                committer.commit_result(row, r)
-                if committer.new % 500 == 0:
-                    log(f"Output checkpoint: +{committer.new:,} this session")
-                if cfg.stop_after_outputs and committer.new >= cfg.stop_after_outputs:
-                    raise _Stop
     finally:
         ex.shutdown(cancel_futures=True)
 

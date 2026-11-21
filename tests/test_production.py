@@ -182,6 +182,40 @@ def test_worker_crash_is_isolated_and_passed_through(tmp_path, files, monkeypatc
     assert data == files["proj1/part1/layout.dxf"]
 
 
+@pytest.mark.parametrize("break_at", [1, 3, 6])
+def test_pool_broken_at_submit_drops_and_repeats_nothing(serial_run, tmp_path, files, monkeypatch, break_at):
+    """Deterministic submit-side race: the pool is already broken when the next row is submitted."""
+    from concurrent.futures.process import BrokenProcessPool
+    real_pool, calls, submitted = pr.pool, {"pools": 0}, []
+
+    def flaky_pool(*a, **kw):
+        ex = real_pool(*a, **kw)
+        if a[2:3] != (pr._init_transform_worker,):
+            return ex  # discovery pools are untouched
+        calls["pools"] += 1
+        if calls["pools"] == 1:  # only the first (parallel) pool breaks
+            real_submit, n = ex.submit, {"k": 0}
+
+            def submit(fn, *args):
+                n["k"] += 1
+                if n["k"] >= break_at:
+                    raise BrokenProcessPool("simulated: worker died between completion and submit")
+                submitted.append(args[2])
+                return real_submit(fn, *args)
+            ex.submit = submit
+        return ex
+    monkeypatch.setattr(pr, "pool", flaky_pool)
+    head = make_workspace(tmp_path, files)
+    out = pr.run(cfg_for(tmp_path, head, len(files)))
+    assert out["phase"] == "packaged" and not out.get("errors")
+    assert out["output_objects"] == len(files)
+    assert "worker_crash" not in out["failed_reasons"]  # no row was falsely blamed
+    assert len(submitted) == break_at - 1
+    root_s, _ = serial_run
+    assert tree_digest(tmp_path / "attempts/attempt-1/corpus") == tree_digest(root_s / "attempts/attempt-1/corpus")
+    assert ledger_rows(tmp_path) == ledger_rows(root_s)
+
+
 def _old_runner_state(tmp_path, files):
     """Discovery-only state as the dc3da69 serial runner leaves it (same tables, seed, catalog)."""
     head = make_workspace(tmp_path, files)
