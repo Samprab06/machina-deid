@@ -38,6 +38,7 @@ MIT-licensed, resumable, format-aware pseudonymization pipeline for the Builders
 ## Modules
 
 - `src/machina_deid/identity.py` — HMAC-SHA256 pseudonym mapper (`PseudonymMapper`, `load_secret`). The secret comes from an explicit file path or the `MACHINA_DEID_SECRET` environment variable (min 16 bytes); there is no default. The persisted JSON map holds only HMAC digests and pseudonyms, never raw identities or the secret. Keep the secret file outside the repo (e.g. `chmod 600`).
+- `src/machina_deid/catalog.py` — persistent SQLite identity catalog (Phase 5A): HMAC-keyed identities and observations, explicit aliases only (no fuzzy merging), redacted reports. See `docs/identity-catalog.md`.
 - `src/machina_deid/classify.py` — conservative extension + magic-byte classifier; reads at most 16 bytes per file, and reports `verified`, `unverified`, `mismatch`, `empty`, or `unknown`. It never implies a rewrite is supported.
 
 ## Local test and safety commands
