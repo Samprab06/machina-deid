@@ -319,7 +319,7 @@ def _shifted_runs(page, keep: list) -> list[tuple[float, float, float, str]]:
             by_row.setdefault((round(b[lo] * 2), round(b[hi] * 2)), []).append((c, b))
         for row, chs in by_row.items():
             cands = [(c, b) for c, b in extra if (round(b[lo] * 2), round(b[hi] * 2)) == row]
-            for sign in ((1,) if axis == "x" else (1, -1)):
+            for sign in (1, -1):
                 diffs = []
                 for c, b in chs:
                     near = [sign * (b[along] - b2[along]) for c2, b2 in cands

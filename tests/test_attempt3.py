@@ -72,7 +72,7 @@ def test_embedded_mention_rewritten_and_trailing_text_kept(tmp_path):
         assert abs(src[w][0] - dst[w][0]) < 0.05, (w, src[w][0], dst[w][0])
 
 
-@pytest.mark.parametrize("rot,origin", [(90, (100, 700)), (270, (100, 100))])
+@pytest.mark.parametrize("rot,origin", [(90, (100, 700)), (270, (100, 100)), (180, (500, 400))])
 def test_rotated_text_matrix_reflow_fixed(tmp_path, rot, origin):
     """Mid-string edit in vertical (rotated text-matrix) text: trailing glyphs restored, page not skipped."""
     d = pymupdf.open()
