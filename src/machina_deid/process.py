@@ -17,6 +17,13 @@ Safety properties
 - PDF/DXF are transformed only when an explicit identity map for that format is given;
   otherwise they are passed through unchanged with a ``no_identity_map`` limitation.
   Nothing is inferred or guessed.
+- ZIP archives are always rebuilt and verified via ``archive.transform_zip`` (bounded,
+  never extracted under member names). Without ``--archive-map`` supported members are
+  copied unchanged and the record outcome is ``inspected_no_map`` (never a
+  de-identification claim). With a map the archive outcome is ``transformed_validated`` /
+  ``inspected_no_identifiers`` only when the archive result is ``complete``; residual
+  identities fail the record (nothing materialized) and unsupported members leave it
+  ``unsupported_passthrough``. The note records per-member outcome counts.
 - Unsupported-but-valid files (everything else, including native SolidWorks/Inventor
   binaries) are copied byte-for-byte; the record carries ``disposition=passthrough`` and
   a limitation note. No native CAD rewriting is performed.
@@ -42,7 +49,7 @@ from .state import StateDB, StateError, output_path_for
 HARD_MAX_FILES = 5000
 DEFAULT_MAX_BYTES = 5 * 1024**3
 DEFAULT_MIN_FREE = 5 * 1024**3
-_TRANSFORMERS = {"pdf", "dxf", "step"}
+_TRANSFORMERS = {"pdf", "dxf", "step", "zip"}
 
 
 class ProcessError(Exception):
@@ -119,6 +126,53 @@ def _variant(rec_transformer: str | None, maps: dict[str, tuple[IdentityMap, str
     return "passthrough", None
 
 
+def _archive_note(res, mapped: bool) -> str:
+    parts = [f"archive_complete={int(bool(res.complete))}", f"map={int(mapped)}"]
+    parts += [f"{k}={v}" for k, v in sorted(res.counts.items())]
+    parts += [f"residual_members={len(res.residual_members)}",
+              f"unsupported_members={len(res.unsupported_members)}"]
+    return "archive:" + ";".join(parts)
+
+
+def _build_archive(src: Path, sha: str, cas: Path, maps, tmp_dir: Path):
+    from .archive import transform_zip
+    mapped = "zip" in maps
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp = tmp_dir / f"{uuid.uuid4().hex[:12]}.zip"
+    try:
+        try:
+            res = transform_zip(src, tmp, maps["zip"][0] if mapped else None)
+        except Exception as exc:
+            raise _Fail(f"archive_error_{type(exc).__name__}") from None
+        if not res.ok:
+            raise _Fail("archive_" + (res.reason or "rebuild_failed"))
+        if res.source_sha256 != sha or not res.source_unchanged:
+            raise _Fail("source_changed_during_read")
+        if not all(res.verification.values()) or sha256_file(tmp) != res.output_sha256:
+            raise _Fail("archive_rebuild_verification_failed")
+        note = _archive_note(res, mapped)
+        if not mapped:
+            outcome = "inspected_no_map"
+        elif res.complete:
+            outcome = ("transformed_validated" if res.counts.get("transformed_validated")
+                       else "inspected_no_identifiers")
+        elif res.residual_members:
+            raise _Fail("archive_residual_identifiers", "identifiers_unmodifiable")
+        else:
+            outcome = "unsupported_passthrough"  # members left unchanged; never complete
+        disp = "transformed" if outcome == "transformed_validated" else "archive_rebuilt"
+        _atomic_copy(tmp, cas)
+        out_sha = sha256_file(cas)
+        if out_sha != res.output_sha256:
+            cas.unlink()
+            raise _Fail("archive_output_hash_mismatch")
+        return out_sha, disp, note, "archive_rebuilt_verified", outcome
+    finally:
+        for leftover in (tmp, *tmp_dir.glob(f".{tmp.name}.*.partial")):
+            if leftover.exists():
+                leftover.unlink()
+
+
 def _ext_for(rel: str, kind: str | None) -> str:
     return f".{kind}" if kind else ".bin"
 
@@ -155,6 +209,8 @@ def _build_artifact(src: Path, sha: str, variant: str, kind: str | None, cas: Pa
     """Create the CAS artifact; return (output_sha, disposition, note, validation, outcome) or raise _Fail."""
     if kind is None:
         return _passthrough(src, sha, cas), "passthrough", None, "bytes_identical", "unsupported_passthrough"
+    if kind == "zip":
+        return _build_archive(src, sha, cas, maps, tmp_dir)
     if kind not in maps:
         from . import discovery
         try:
@@ -241,14 +297,14 @@ def _materialize(cas: Path, target: Path, expected_sha: str, mode: str) -> str:
 
 
 def plan(manifest: str | Path, source_root: str | Path, *, limit: int, pdf_map: str | None = None,
-         dxf_map: str | None = None, step_map: str | None = None) -> dict:
+         dxf_map: str | None = None, step_map: str | None = None, archive_map: str | None = None) -> dict:
     """Dry run: classify + hash the first ``limit`` rows and report what ``process`` would do. Writes nothing."""
     _bounds(limit, None)
     root = Path(source_root).resolve()
     rows, bad = mf.parse_manifest(manifest)
     rows = rows[:limit]
-    kinds = {k for k, v in (("pdf", pdf_map), ("dxf", dxf_map), ("step", step_map)) if v}
-    for v in (pdf_map, dxf_map, step_map):
+    kinds = {k for k, v in (("pdf", pdf_map), ("dxf", dxf_map), ("step", step_map)) if v} | {"zip"}
+    for v in (pdf_map, dxf_map, step_map, archive_map):
         if v:
             load_idmap(v)  # validate only
     by_disp, groups, bytes_unique, bytes_total = Counter(), Counter(), 0, 0
@@ -265,8 +321,12 @@ def plan(manifest: str | Path, source_root: str | Path, *, limit: int, pdf_map: 
         fmt = cls.format if cls.status in ("verified", "unverified") else None
         kind = fmt if fmt in kinds else None
         sha = sha256_file(phys)
-        by_disp["transform:" + kind if kind else "passthrough"] += 1
-        key = (sha, kind or "passthrough")
+        if kind == "zip":
+            label = "archive:" + ("mapped" if archive_map else "inspect_no_map")
+        else:
+            label = "transform:" + kind if kind else "passthrough"
+        by_disp[label] += 1
+        key = (sha, label)
         groups[key] += 1
         size = phys.stat().st_size
         bytes_total += size
@@ -288,7 +348,7 @@ def _bounds(limit: int, max_bytes: int | None) -> None:
 
 def process(manifest: str | Path, source_root: str | Path, output_root: str | Path, work_dir: str | Path, *,
             limit: int, max_bytes: int | None = DEFAULT_MAX_BYTES, pdf_map: str | None = None,
-            dxf_map: str | None = None, step_map: str | None = None, link_mode: str = "auto", retry_failed: bool = False,
+            dxf_map: str | None = None, step_map: str | None = None, archive_map: str | None = None, link_mode: str = "auto", retry_failed: bool = False,
             min_free: int = DEFAULT_MIN_FREE) -> dict:
     """Ingest up to ``limit`` manifest rows and process up to ``limit`` pending records. Resumable."""
     _bounds(limit, max_bytes)
@@ -296,7 +356,7 @@ def process(manifest: str | Path, source_root: str | Path, output_root: str | Pa
         raise ProcessError("link_mode must be 'auto' or 'copy'")
     root, out_root, work = check_layout(Path(source_root), Path(output_root), Path(work_dir))
     maps: dict[str, tuple[IdentityMap, str]] = {}
-    for kind, path in (("pdf", pdf_map), ("dxf", dxf_map), ("step", step_map)):
+    for kind, path in (("pdf", pdf_map), ("dxf", dxf_map), ("step", step_map), ("zip", archive_map)):
         if path:
             try:
                 maps[kind] = (load_idmap(path), sha256_file(Path(path)))

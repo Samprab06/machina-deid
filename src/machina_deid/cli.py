@@ -106,11 +106,11 @@ def cmd_process(a) -> int:
     try:
         if a.dry_run:
             res = pr.plan(a.manifest, a.source_root, limit=a.limit, pdf_map=a.pdf_map, dxf_map=a.dxf_map,
-                          step_map=a.step_map)
+                          step_map=a.step_map, archive_map=a.archive_map)
         else:
             res = pr.process(a.manifest, a.source_root, a.output_root, a.work_dir, limit=a.limit,
                              max_bytes=mf.parse_size(a.max_bytes), pdf_map=a.pdf_map, dxf_map=a.dxf_map,
-                             step_map=a.step_map, link_mode=a.link_mode, retry_failed=a.retry_failed,
+                             step_map=a.step_map, archive_map=a.archive_map, link_mode=a.link_mode, retry_failed=a.retry_failed,
                              min_free=mf.parse_size(a.min_free))
     except (pr.ProcessError, IdentityMapError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -183,6 +183,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--pdf-map")
     p.add_argument("--dxf-map")
     p.add_argument("--step-map", help="explicit identity map for STEP/STP FILE_NAME header strings")
+    p.add_argument("--archive-map",
+                   help="explicit identity map (same JSON strings format) applied to PDF/DXF/STEP members "
+                        "inside .zip archives. ZIPs are always rebuilt and verified; without this map "
+                        "supported members are copied unchanged and reported inspected_no_map (not "
+                        "de-identified). Archives with residual identities fail; unsupported members "
+                        "keep the record incomplete (unsupported_passthrough)")
     p.add_argument("--link-mode", choices=["auto", "copy"], default="auto")
     p.add_argument("--retry-failed", action="store_true")
     p.add_argument("--dry-run", action="store_true", help="classify/hash and report the plan; write nothing")

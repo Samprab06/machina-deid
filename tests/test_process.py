@@ -234,3 +234,90 @@ def test_step_outcomes_and_cached_aliases(tmp_path, mapping, expected, status):
         assert result['this_run']['cas_reused'] == 1
         assert all((out / n).is_file() for n in ('one.step', 'two.step'))
     assert pr.process(*args, limit=2, step_map=str(idmap), min_free=0)['claimed'] == 0
+
+
+def _clean_step():
+    from step_helpers import DATA, step_bytes
+    return step_bytes(data=DATA.replace(NAME.encode(), b'P'))
+
+
+def _zip_env(tmp_path, members):
+    import zipfile
+    src, out, work = (tmp_path / n for n in ('src', 'out', 'work'))
+    src.mkdir()
+    zp = src / 'bundle.zip'
+    with zipfile.ZipFile(zp, 'w') as z:
+        for name, data in members.items():
+            z.writestr(name, data)
+    (src / 'copy.zip').write_bytes(zp.read_bytes())
+    manifest = tmp_path / 'manifest.tsv'
+    manifest.write_text(''.join(f'{n}\t{(src / n).stat().st_size}\t\n' for n in ('bundle.zip', 'copy.zip')))
+    return (manifest, src, out, work), zp.read_bytes()
+
+
+def _records(work):
+    from contextlib import closing
+    with closing(StateDB(work / 'state.sqlite')) as db:
+        return [dict(r) for r in db.conn.execute('SELECT * FROM records ORDER BY id')]
+
+
+def _write_map(tmp_path, mapping):
+    p = tmp_path / 'map.json'
+    p.write_text(json.dumps({'strings': mapping}))
+    return str(p)
+
+
+def test_archive_no_map_inspected_not_deidentified(tmp_path):
+    from step_helpers import step_bytes
+    args, src_bytes = _zip_env(tmp_path, {'d/part.step': step_bytes(), 'readme.txt': b'hi'})
+    res = pr.process(*args, limit=2, min_free=0)
+    assert res['this_run']['outcome_inspected_no_map'] == 2
+    assert res['this_run']['cas_reused'] == 1
+    recs = _records(args[3])
+    for r in recs:
+        assert r['status'] == 'validated' and r['outcome'] == 'inspected_no_map'
+        assert r['disposition'] == 'archive_rebuilt' and r['validation_status'] == 'archive_rebuilt_verified'
+        assert 'archive_complete=0' in r['note'] and 'inspected_no_map=1' in r['note']
+        assert r['input_sha256'] == sha(src_bytes)
+        assert r['output_sha256'] == sha((args[2] / r['source_rel_path']).read_bytes())
+    assert (args[1] / 'bundle.zip').read_bytes() == src_bytes  # source untouched
+    assert pr.process(*args, limit=2, min_free=0)['claimed'] == 0
+
+
+def test_archive_mapped_transformed_complete(tmp_path):
+    import zipfile
+    from step_helpers import step_bytes
+    args, _ = _zip_env(tmp_path, {'d/': b'', 'd/part.step': _clean_step()})
+    res = pr.process(*args, limit=2, min_free=0, archive_map=_write_map(tmp_path, {NAME: 'Person A'}))
+    assert res['this_run']['outcome_transformed_validated'] == 2
+    r = _records(args[3])[0]
+    assert r['disposition'] == 'transformed' and 'archive_complete=1' in r['note']
+    with zipfile.ZipFile(args[2] / 'bundle.zip') as z:
+        assert NAME.encode() not in z.read('d/part.step')
+        assert b'Person A' in z.read('d/part.step')
+
+
+def test_archive_mapped_unsupported_member_not_complete(tmp_path):
+    from step_helpers import step_bytes
+    args, _ = _zip_env(tmp_path, {'d/part.step': _clean_step(), 'notes.bin': b'no identities'})
+    res = pr.process(*args, limit=2, min_free=0, archive_map=_write_map(tmp_path, {NAME: 'Person A'}))
+    assert res['this_run']['outcome_unsupported_passthrough'] == 2
+    r = _records(args[3])[0]
+    assert r['status'] == 'validated' and r['disposition'] == 'archive_rebuilt'
+    assert 'archive_complete=0' in r['note'] and 'unsupported_members=1' in r['note']
+
+
+def test_archive_mapped_residual_fails_not_materialized(tmp_path):
+    args, _ = _zip_env(tmp_path, {'leak.txt': f'by {NAME}'.encode()})
+    res = pr.process(*args, limit=2, min_free=0, archive_map=_write_map(tmp_path, {NAME: 'Person A'}))
+    assert res['this_run']['outcome_identifiers_unmodifiable'] == 2
+    assert all(r['status'] == 'failed' for r in _records(args[3]))
+    assert not list(args[2].rglob('*.zip'))
+
+
+def test_unsafe_archive_fails(tmp_path):
+    args, _ = _zip_env(tmp_path, {'../evil.txt': b'x'})
+    res = pr.process(*args, limit=2, min_free=0)
+    assert res['this_run']['failed'] == 2
+    assert {r['error_category'] for r in _records(args[3])} == {'archive_path_traversal'}
+    assert not list(args[2].rglob('*.zip'))
