@@ -38,10 +38,10 @@ vector drawings, images, links, page boxes/rotation unchanged; independent whole
 ## Metrics and failure classes
 
 `scoped_removal` (occurrence: original absent in its region, a different replacement extractable and rendered;
-fallback/unchanged copy or missing output always fails), `same_identity` (pairs within an entity, both
-successful and same pseudonym token — full and fitted forms share the token), `cross_document_triplets`
-(triples of an entity's occurrences in 3 different documents; our proxy for the triplet metric),
-`distinctness_collisions`, `engineering` (geometry, drawings, images, keep-labels, chars changed outside label
+fallback/unchanged copy or missing output always fails), `same_identity` (cross-document pairs within an
+entity, both successful with the same pseudonym token), and `distinct_identity_triplets` (three labelled
+entities all rewritten with different tokens). `cross_document_triplets` measures consistency across three
+documents of one entity. Also report `distinctness_collisions` and `engineering` (geometry, drawings, images, keep-labels, chars changed outside label
 regions — unlabelled replacements show up there as a count, not a failure).
 
 Failure classes with `--trace`: `discovery` (no pipeline record overlapping the label), `resolution`
@@ -79,6 +79,7 @@ by kind are enough to direct the next change.
 ## OCR / textless pages
 
 `survey` reports first-page classes `text`, `image_scan` (> 50 % image cover), `vector_outlined` (no text,
-> 50 vector paths: text drawn as outlines), `empty_or_sparse`, plus `ocr.tesseract`. No OCR engine is installed
-here; `transform_pdf_scoped` counts `textless_pages` and never claims them clean. Outlined/scanned title blocks
-are a known gap: redaction would need OCR boxes plus raster/vector edits, which this slice does not do.
+> 50 vector paths: text drawn as outlines), `empty_or_sparse`, plus `ocr.tesseract`. The production runner's
+`--scope-ocr` flag uses PyMuPDF's Tesseract integration for textless pages. It checks the rendered area outside
+edits and rechecks the edited region. The laboratory commands above exercise the text pipeline. See the
+[Attempt 2 handoff](attempt-2-handoff.md) for materialized production evaluation.

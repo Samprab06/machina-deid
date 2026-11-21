@@ -79,3 +79,25 @@ def test_survey_and_propose_cli(corpus, capsys):
     assert (tmp / "draft.jsonl").stat().st_mode & 0o077 == 0 and list((tmp / "crops").glob("*.png"))
     # proposed-but-unconfirmed rows are never scored
     assert load_labels(tmp / "draft.jsonl") == []
+
+
+def test_distinct_triplets_count_collisions_and_failed_rewrites():
+    from machina_deid.pdf_eval import Label, Occ, _metrics
+
+    def occurrence(entity, token, *, ok=True, doc=None):
+        label = Label(doc or entity, 0, (0, 0, 10, 10), entity, entity=entity)
+        return Occ(label, ok, "" if ok else "rewrite", token)
+
+    distinct = [occurrence("a", "one"), occurrence("b", "two"), occurrence("c", "three")]
+    assert _metrics(distinct, {}, 100, 1)["distinct_identity_triplets"] == {"ok": 1, "total": 1, "rate": 1.0}
+    for third in (occurrence("c", "one"), occurrence("c", "", ok=False)):
+        result = _metrics([*distinct[:2], third], {}, 100, 1)
+        assert result["distinct_identity_triplets"] == {"ok": 0, "total": 1, "rate": 0.0}
+
+
+def test_same_identity_metric_requires_different_documents():
+    from machina_deid.pdf_eval import Label, Occ, _metrics
+
+    label = Label("same.pdf", 0, (0, 0, 10, 10), "original", entity="one")
+    occurrence = Occ(label, True, "", "alias")
+    assert _metrics([occurrence, occurrence], {}, 100, 1)["same_identity"]["total"] == 0
